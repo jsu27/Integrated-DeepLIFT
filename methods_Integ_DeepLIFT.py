@@ -151,85 +151,10 @@ class PerturbationBasedMethod(AttributionMethod):
 # -----------------------------------------------------------------------------
 # ATTRIBUTION METHODS
 # -----------------------------------------------------------------------------
+"""
+Returns zero attributions. For testing only.
+"""
 
-class IntegratedDeepLIFT(GradientBasedMethod):
-
-    _deeplift_ref = {}
-    def __init__(self, T, X, xs, session, keras_learning_phase, steps=100, baseline=None):
-        super(IntegratedDeepLIFT, self).__init__(T, X, xs, session, keras_learning_phase)
-        self.steps = steps
-        self.baseline = baseline
-    @classmethod
-    def nonlinearity_grad_override(cls, op, grad):
-        output = op.outputs[0]
-        input = op.inputs[0]
-        ref_input = cls._deeplift_ref[op.name]
-        ref_output = activation(op.type)(ref_input)
-        delta_out = output - ref_output
-        delta_in = input - ref_input
-        instant_grad = activation(op.type)(0.5 * (ref_input + input))
-        return tf.where(tf.abs(delta_in) > 1e-5, grad * delta_out / delta_in,
-                               original_grad(instant_grad.op, grad))
-
-
-
-        # Run the default run
-        #return super(IntegratedDeepLIFT, self).run()
-    def run(self):
-        # Check user baseline or set default one
-        self._set_check_baseline()
-
-        # print ('DeepLIFT: computing references...')
-        sys.stdout.flush()
-        self._deeplift_ref.clear()
-        ops = []
-        g = tf.get_default_graph()
-        for op in g.get_operations():
-            if len(op.inputs) > 0 and not op.name.startswith('gradients'):
-                if op.type in SUPPORTED_ACTIVATIONS:
-                    ops.append(op)
-
-
-
-        attributions = self.get_symbolic_attribution()
-        gradient = None
-        for alpha in list(np.linspace(1. / self.steps, 1.0, self.steps)):
-
-            xs_mod = [b + (xs - b) * alpha for xs, b in zip(self.xs, self.baseline)] if self.has_multiple_inputs \
-                else self.baseline + (self.xs - self.baseline) * alpha
-            # Init references with a forward pass
-            YR = self.session_run([o.inputs[0] for o in ops], xs_mod)
-            for (r, op) in zip(YR, ops):
-                self._deeplift_ref[op.name] = r
-
-            _attr = self.session_run(attributions, xs_mod)
-            if gradient is None: gradient = _attr
-            else: gradient = [g + a for g, a in zip(gradient, _attr)]
-
-        results = [g * (x - b) / self.steps for g, x, b in zip(
-            gradient,
-            self.xs if self.has_multiple_inputs else [self.xs],
-            self.baseline if self.has_multiple_inputs else [self.baseline])]
-
-        return results[0] if not self.has_multiple_inputs else results
-
-'''
-    def _init_references(self):
-        # print ('DeepLIFT: computing references...')
-        sys.stdout.flush()
-        self._deeplift_ref.clear()
-        ops = []
-        g = tf.get_default_graph()
-        for op in g.get_operations():
-            if len(op.inputs) > 0 and not op.name.startswith('gradients'):
-                if op.type in SUPPORTED_ACTIVATIONS:
-                    ops.append(op)
-        YR = self.session_run([o.inputs[0] for o in ops], self.baseline)
-        for (r, op) in zip(YR, ops):
-            self._deeplift_ref[op.name] = r
-        # print('DeepLIFT: references ready')
-        sys.stdout.flush()
-'''
 
 class DummyZero(GradientBasedMethod):
 
@@ -287,7 +212,8 @@ class IntegratedGradients(GradientBasedMethod):
         attributions = self.get_symbolic_attribution()
         gradient = None
         for alpha in list(np.linspace(1. / self.steps, 1.0, self.steps)):
-            xs_mod = [xs * alpha for xs in self.xs] if self.has_multiple_inputs else self.xs * alpha
+            xs_mod = [b + (xs - b) * alpha for xs, b in zip(self.xs, self.baseline)] if self.has_multiple_inputs \
+                else self.baseline + (self.xs - self.baseline) * alpha
             _attr = self.session_run(attributions, xs_mod)
             if gradient is None: gradient = _attr
             else: gradient = [g + a for g, a in zip(gradient, _attr)]
@@ -459,7 +385,63 @@ class Occlusion(PerturbationBasedMethod):
                           'probably because window_shape and step do not allow to cover the all input.')
         return attribution
 
+class IntegratedDeepLIFT(GradientBasedMethod):
 
+    _deeplift_ref = {}
+    def __init__(self, T, X, xs, session, keras_learning_phase, steps=100, baseline=None):
+        super(IntegratedDeepLIFT, self).__init__(T, X, xs, session, keras_learning_phase)
+        self.steps = steps
+        self.baseline = baseline
+    @classmethod
+    def nonlinearity_grad_override(cls, op, grad):
+        output = op.outputs[0]
+        input = op.inputs[0]
+        ref_input = cls._deeplift_ref[op.name]
+        ref_output = activation(op.type)(ref_input)
+        delta_out = output - ref_output
+        delta_in = input - ref_input
+        instant_grad = activation(op.type)(0.5 * (ref_input + input))
+        return tf.where(tf.abs(delta_in) > 1e-5, grad * delta_out / delta_in,
+                               original_grad(instant_grad.op, grad))
+
+
+
+        # Run the default run
+        #return super(IntegratedDeepLIFT, self).run()
+    def run(self):
+        # Check user baseline or set default one
+        self._set_check_baseline()
+        # print ('DeepLIFT: computing references...')
+        sys.stdout.flush()
+        self._deeplift_ref.clear()
+        ops = []
+        g = tf.get_default_graph()
+        for op in g.get_operations():
+            if len(op.inputs) > 0 and not op.name.startswith('gradients'):
+                if op.type in SUPPORTED_ACTIVATIONS:
+                    ops.append(op)
+
+        #attributions = self.get_symbolic_attribution()
+        gradient = None
+        for alpha in list(np.linspace(1. / self.steps, 1.0, self.steps)):
+
+            xs_mod = [b + (xs - b) * alpha for xs, b in zip(self.xs, self.baseline)] if self.has_multiple_inputs \
+                else self.baseline + (self.xs - self.baseline) * alpha
+            # Init references with a forward pass
+            YR = self.session_run([o.inputs[0] for o in ops], xs_mod)
+            for (r, op) in zip(YR, ops):
+                self._deeplift_ref[op.name] = r
+            attributions = self.get_symbolic_attribution()
+            _attr = self.session_run(attributions, xs_mod)
+            if gradient is None: gradient = _attr
+            else: gradient = [g + a for g, a in zip(gradient, _attr)]
+
+        results = [g * (x - b) / self.steps for g, x, b in zip(
+            gradient,
+            self.xs if self.has_multiple_inputs else [self.xs],
+            self.baseline if self.has_multiple_inputs else [self.baseline])]
+
+        return results[0] if not self.has_multiple_inputs else results
 # -----------------------------------------------------------------------------
 # END ATTRIBUTION METHODS
 # -----------------------------------------------------------------------------
@@ -472,8 +454,8 @@ attribution_methods = OrderedDict({
     'intgrad': (IntegratedGradients, 3),
     'elrp': (EpsilonLRP, 4),
     'deeplift': (DeepLIFTRescale, 5),
-    'occlusion': (Occlusion, 6)
-    #'integdeeplift': (IntegratedDeepLIFT, 7)
+    'occlusion': (Occlusion, 6),
+    'integdeeplift': (IntegratedDeepLIFT, 7)
 })
 
 
@@ -524,18 +506,13 @@ class DeepExplain(object):
             method_class, method_flag = attribution_methods[self.method]
         else:
             raise RuntimeError('Method must be in %s' % list(attribution_methods.keys()))
-        print("sdfsd")
         print('DeepExplain: running "%s" explanation method (%d)' % (self.method, method_flag))
         self._check_ops()
-        print("TEST0")
         _GRAD_OVERRIDE_CHECKFLAG = 0
-        print("TEST1")
+
         _ENABLED_METHOD_CLASS = method_class
-        print("TEST2")
         method = _ENABLED_METHOD_CLASS(T, X, xs, self.session, self.keras_phase_placeholder, **kwargs)
-        print("TEST3")
         result = method.run()
-        print("TEST4")
         if issubclass(_ENABLED_METHOD_CLASS, GradientBasedMethod) and _GRAD_OVERRIDE_CHECKFLAG == 0:
             warnings.warn('DeepExplain detected you are trying to use an attribution method that requires '
                           'gradient override but the original gradient was used instead. You might have forgot to '
