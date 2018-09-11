@@ -429,9 +429,10 @@ class IntegratedDeepLIFT(GradientBasedMethod):
         #print(initial_reference_values)
         for op,ref_val in zip(ops,initial_reference_values):
             #print(op)
-            #print(ref_val)
+            print(ref_val.shape)
             self._deeplift_ref[op.name] = tf.Variable(ref_val, name=op.name+"_reference")
-
+        attributions = self.get_symbolic_attribution()
+        print(attributions)
         for alpha in list(np.linspace(1. / self.steps, 1.0, self.steps)):
 
             xs_mod = [b + (xs - b) * alpha for xs, b in zip(self.xs, self.baseline)] if self.has_multiple_inputs \
@@ -439,15 +440,18 @@ class IntegratedDeepLIFT(GradientBasedMethod):
             # Init references with a forward pass
             assignment_ops = []
             for op in ops:
-                #print(op)
-                #print(op.name)
-                #print(self._deeplift_ref[op.name])
+                #self._deeplift_ref[op.name].assign(op.inputs[0])
+                print(op.inputs[0].shape)
                 assignment_ops.append(self._deeplift_ref[op.name].assign(op.inputs[0]))
-            self.session_run([o for o in assignment_ops], xs_mod)
+            print(np.array(assignment_ops).shape)
+            print(np.array(xs_mod).shape)
+
+            YR = self.session_run(assignment_ops, xs_mod)
+            print(YR)
             #YR = self.session_run([o.inputs[0] for o in ops], xs_mod)
             #for (r, op) in zip(YR, ops):
             #    self._deeplift_ref[op.name] = r
-            attributions = self.get_symbolic_attribution()
+
             _attr = self.session_run(attributions, xs_mod)
             if gradient is None: gradient = _attr
             else: gradient = [g + a for g, a in zip(gradient, _attr)]
