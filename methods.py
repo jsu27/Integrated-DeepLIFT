@@ -386,7 +386,7 @@ class Occlusion(PerturbationBasedMethod):
                           'probably because window_shape and step do not allow to cover the all input.')
         return attribution
 
-class IntegratedDeepLIFT(GradientBasedMethod):
+class IntegratedDeepLIFT(GradientBasedMethod): 
 
     _deeplift_ref = {}
     def __init__(self, T, X, xs, session, keras_learning_phase, steps=100, baseline=None):
@@ -394,11 +394,18 @@ class IntegratedDeepLIFT(GradientBasedMethod):
         self.steps = steps
         self.baseline = baseline
     @classmethod
-    def nonlinearity_grad_override(cls, op, grad):
-        output = op.outputs[0]
-        input = op.inputs[0]
-        ref_input = cls._deeplift_ref[op.name]
-        ref_output = activation(op.type)(ref_input)
+    def nonlinearity_grad_override(cls, op, grad): #custom gradient for DeepLIFT multiplier
+        input = op.inputs[0] #inputs to `op`, using all steps in the interpolation as model input, for a single example
+        output = op.outputs[0] #outputs from op ''
+        
+        #`ref_input` (below) is the list of reference values, for the corresponding input values in `input` (with steps in interpolation as model input).
+        #Because for each step in the interpolation, its reference value is equal to the previous step's value,
+        #the reference for a step in `input` is equal to the previous step's value.
+        #So we define ref_input to be `input`, shifted one index to the right, so that each step in `input` can be matched with its "previous step" in `ref_input`. 
+        #To keep dimensions correct, the 1st step in `ref_input` (which is now empty) will be set to the 1st step in `input` (e.g. if `input` is [1,2,3,4], `ref_input` is [1,1,2,3]). 
+        #We will be ignoring the 1st index of the attributions anyway, because it corresponds to the baseline as input.
+        ref_input = tf.concat([input[0:1], input[0:-1]], axis=0) #input[0:1] is 1st component; input[0:-1] ranges from 1st to second-to-last component
+        ref_output = tf.concat([output[0:1], output[0:-1]], axis=0) #same logic for reference output
         delta_out = output - ref_output
         delta_in = input - ref_input
         instant_grad = activation(op.type)(0.5 * (ref_input + input))
@@ -410,7 +417,7 @@ class IntegratedDeepLIFT(GradientBasedMethod):
             if self.has_multiple_inputs:
                 self.baseline = [np.zeros(xi.shape) for xi in self.xs]
             else:
-                self.baseline = np.zeros(self.xs.shape) #DEFAULT CASE; assume shape of xs including # of samples
+                self.baseline = np.zeros(self.xs.shape[1:]) #for Integrated DeepLIFT, baseline is exactly the shape of 1 input
 
         else:
             if self.has_multiple_inputs:
@@ -430,46 +437,32 @@ class IntegratedDeepLIFT(GradientBasedMethod):
     def run(self):
         # Check user baseline or set default one
         self._set_check_baseline()
-        # print ('DeepLIFT: computing references...')
         sys.stdout.flush()
         self._deeplift_ref.clear()
-
+        #get all ops in model
         ops = []
         g = tf.get_default_graph()
         for op in g.get_operations():
             if len(op.inputs) > 0 and not op.name.startswith('gradients'):
                 if op.type in SUPPORTED_ACTIVATIONS:
                     ops.append(op)
-
-        initial_reference_values = self.session_run([o.inputs[0] for o in ops], self.baseline)
-        for op,ref_val in zip(ops,initial_reference_values):
-            self._deeplift_ref[op.name] = tf.Variable(ref_val, name=op.name+"_reference")
-
-        attributions = self.get_symbolic_attribution()
-        gradient = None
-
-        for alpha in list(np.linspace(0, 1.0, num=self.steps, endpoint=False)):
-            xs_mod = [b + (xs - b) * alpha for xs, b in zip(self.xs, self.baseline)] if self.has_multiple_inputs \
-                else self.baseline + (self.xs - self.baseline) * alpha #"baseline" xs
-
-            xs_mod1 = [b + (xs - b) * (alpha + 1.0/self.steps) for xs, b in zip(self.xs, self.baseline)] if self.has_multiple_inputs \
-                else self.baseline + (self.xs - self.baseline) * (alpha + 1.0/self.steps) #"actual" xs
+        
+        attributions = self.get_symbolic_attribution() #gradient delT/delX
+        results = []
+        
+        for x in self.xs: #for each example:
             
-            # Init references with a forward pass
-            ref_values = self.session_run([o.inputs[0] for o in ops], xs_mod)
-            for op,ref_val in zip(ops,ref_values):
-                self._deeplift_ref[op.name].load(ref_val, self.session)
-                
-            _attr = self.session_run(attributions, xs_mod1)
-            if gradient is None: gradient = _attr
-            else: gradient = [g + a for g, a in zip(gradient, _attr)]
-
+            interpolation = [self.baseline + i/self.steps*(x - self.baseline) for i in range(self.steps+1)] #evenly-spaced steps ranging from baseline to example's input values
+            attribs = self.session_run(attributions, interpolation)[0] #run attributions with all steps of interpolation at once
+            gradient = np.sum(np.array(attribs[1:]), axis=0) #ignore 1st step, which uses baseline as input
+            results.append(gradient * (x - self.baseline)/self.steps) #result is sum of all (gradient * change in step)
+        '''
         results = [g * (x - b) / self.steps for g, x, b in zip(
             gradient,
             self.xs if self.has_multiple_inputs else [self.xs],
             self.baseline if self.has_multiple_inputs else [self.baseline])]
-
-        return results[0] if not self.has_multiple_inputs else results
+        '''
+        return results 
 # -----------------------------------------------------------------------------
 # END ATTRIBUTION METHODS
 # -----------------------------------------------------------------------------
