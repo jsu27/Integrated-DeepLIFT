@@ -199,10 +199,10 @@ https://arxiv.org/pdf/1703.01365.pdf
 """
 
 
-class IntegratedGradients(GradientBasedMethod):
+class IntegratedGradients_old(GradientBasedMethod):
 
     def __init__(self, T, X, xs, session, keras_learning_phase, steps=100, baseline=None):
-        super(IntegratedGradients, self).__init__(T, X, xs, session, keras_learning_phase)
+        super(IntegratedGradients_old, self).__init__(T, X, xs, session, keras_learning_phase)
         self.steps = steps
         self.baseline = baseline
 
@@ -226,6 +226,33 @@ class IntegratedGradients(GradientBasedMethod):
 
         return results[0] if not self.has_multiple_inputs else results
 
+
+
+class IntegratedGradients(GradientBasedMethod): #FINISH EDITING!!!
+
+    def __init__(self, T, X, xs, session, keras_learning_phase, steps=100, baseline=None):
+        super(IntegratedGradients, self).__init__(T, X, xs, session, keras_learning_phase)
+        self.steps = steps
+        self.baseline = baseline
+    #def get_symbolic_attribution(): #input is entire interpolation of a sample
+    #    return tf.reduce_sum(tf.gradients(self.T, self.X))
+        
+
+    def run(self):
+        # Check user baseline or set default one
+        #self._set_check_baseline()
+        if self.baseline == None:
+            self.baseline = np.zeros(self.xs.shape[1:]) #equiv to shape of 1 sample
+            
+        attributions = self.get_symbolic_attribution()
+        results = []        
+        for x in self.xs:
+            interpolation = [self.baseline + i/self.steps*(x - self.baseline) for i in range(self.steps+1)]
+            attribs = self.session_run(attributions, interpolation)[0]
+            gradient = np.sum(np.array(attribs[1:]), axis=0) #ignore 1st step which is baseline
+            results.append(gradient * (x - self.baseline)/self.steps)
+        
+        return results#[0] if not self.has_multiple_inputs else results
 
 """
 Layer-wise Relevance Propagation with epsilon rule
@@ -463,6 +490,93 @@ class IntegratedDeepLIFT(GradientBasedMethod):
             self.baseline if self.has_multiple_inputs else [self.baseline])]
         '''
         return results 
+    
+
+class IntegratedDeepLIFT_old(GradientBasedMethod): 
+
+    _deeplift_ref = {}
+    def __init__(self, T, X, xs, session, keras_learning_phase, steps=100, baseline=None):
+        super(IntegratedDeepLIFT_old, self).__init__(T, X, xs, session, keras_learning_phase)
+        self.steps = steps
+        self.baseline = baseline
+    @classmethod
+    def nonlinearity_grad_override(cls, op, grad):
+        output = op.outputs[0]
+        input = op.inputs[0]
+        ref_input = cls._deeplift_ref[op.name]
+        ref_output = activation(op.type)(ref_input)
+        delta_out = output - ref_output
+        delta_in = input - ref_input
+        instant_grad = activation(op.type)(0.5 * (ref_input + input))
+        return tf.where(tf.abs(delta_in) > 1e-5, grad * delta_out / delta_in,
+                               original_grad(instant_grad.op, grad))
+
+    def _set_check_baseline(self):
+        if self.baseline is None:
+            if self.has_multiple_inputs:
+                self.baseline = [np.zeros(xi.shape) for xi in self.xs]
+            else:
+                self.baseline = np.zeros(self.xs.shape) #DEFAULT CASE; assume shape of xs including # of samples
+
+        else:
+            if self.has_multiple_inputs:
+                for i, xi in enumerate(self.xs):
+                    if self.baseline[i].shape == self.xs[i].shape[1:]:
+                        self.baseline[i] = np.expand_dims(self.baseline[i], 0)
+                    else:
+                        raise RuntimeError('Baseline shape %s does not match expected shape %s'
+                                           % (self.baseline[i].shape, self.xs[i].shape[1:]))
+            else:
+                if self.baseline.shape == self.xs.shape[1:]:
+                    self.baseline = np.expand_dims(self.baseline, 0)
+                else:
+                    raise RuntimeError('Baseline shape %s does not match expected shape %s'
+                                       % (self.baseline.shape, self.xs.shape[1:]))
+
+    def run(self):
+        # Check user baseline or set default one
+        self._set_check_baseline()
+        # print ('DeepLIFT: computing references...')
+        sys.stdout.flush()
+        self._deeplift_ref.clear()
+
+        ops = []
+        g = tf.get_default_graph()
+        for op in g.get_operations():
+            if len(op.inputs) > 0 and not op.name.startswith('gradients'):
+                if op.type in SUPPORTED_ACTIVATIONS:
+                    ops.append(op)
+
+        initial_reference_values = self.session_run([o.inputs[0] for o in ops], self.baseline)
+        for op,ref_val in zip(ops,initial_reference_values):
+            self._deeplift_ref[op.name] = tf.Variable(ref_val, name=op.name+"_reference")
+
+        attributions = self.get_symbolic_attribution()
+        gradient = None
+
+        for alpha in list(np.linspace(0, 1.0, num=self.steps, endpoint=False)):
+            xs_mod = [b + (xs - b) * alpha for xs, b in zip(self.xs, self.baseline)] if self.has_multiple_inputs \
+                else self.baseline + (self.xs - self.baseline) * alpha #"baseline" xs
+
+            xs_mod1 = [b + (xs - b) * (alpha + 1.0/self.steps) for xs, b in zip(self.xs, self.baseline)] if self.has_multiple_inputs \
+                else self.baseline + (self.xs - self.baseline) * (alpha + 1.0/self.steps) #"actual" xs
+
+            # Init references with a forward pass
+            ref_values = self.session_run([o.inputs[0] for o in ops], xs_mod)
+            for op,ref_val in zip(ops,ref_values):
+                self._deeplift_ref[op.name].load(ref_val, self.session)
+
+            _attr = self.session_run(attributions, xs_mod1)
+            if gradient is None: gradient = _attr
+            else: gradient = [g + a for g, a in zip(gradient, _attr)]
+
+        results = [g * (x - b) / self.steps for g, x, b in zip(
+            gradient,
+            self.xs if self.has_multiple_inputs else [self.xs],
+            self.baseline if self.has_multiple_inputs else [self.baseline])]
+
+        return results[0] if not self.has_multiple_inputs else results
+
 # -----------------------------------------------------------------------------
 # END ATTRIBUTION METHODS
 # -----------------------------------------------------------------------------
@@ -476,7 +590,9 @@ attribution_methods = OrderedDict({
     'elrp': (EpsilonLRP, 4),
     'deeplift': (DeepLIFTRescale, 5),
     'occlusion': (Occlusion, 6),
-    'integdeeplift': (IntegratedDeepLIFT, 7)
+    'integdeeplift': (IntegratedDeepLIFT, 7),
+    'integdeeplift_old': (IntegratedDeepLIFT_old, 8),
+    'intgrad_old': (IntegratedGradients_old, 8)
 })
 
 
