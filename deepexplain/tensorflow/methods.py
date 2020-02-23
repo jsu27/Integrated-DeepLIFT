@@ -390,12 +390,6 @@ class IntegratedDeepLIFT_v2(GradientBasedMethod):
         self.steps = steps
         super(IntegratedDeepLIFT_v2, self).__init__(T, X, session, keras_learning_phase)
 
-    def get_symbolic_attribution(self):
-        return [g * (x - b) for g, x, b in zip(
-            tf.gradients(self.T, self.X),
-            self.X if self.has_multiple_inputs else [self.X],
-            self.baseline if self.has_multiple_inputs else [self.baseline])]
-
     def run(self, xs, ys=None, batch_size=None):
         self._check_input_compatibility(xs, ys, batch_size)
 
