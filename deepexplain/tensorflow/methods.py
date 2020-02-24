@@ -450,12 +450,6 @@ class IntegratedDeepLIFT(GradientBasedMethod): #shapes of self.Y and ys do not m
         self.steps = steps
         super(IntegratedDeepLIFT, self).__init__(T, X, session, keras_learning_phase)
 
-    def get_symbolic_attribution(self):
-        return [g * (x - b) for g, x, b in zip(
-            tf.gradients(self.T, self.X),
-            self.X if self.has_multiple_inputs else [self.X],
-            self.baseline if self.has_multiple_inputs else [self.baseline])]
-
     def run(self, xs, ys=None, batch_size=None):
         self._check_input_compatibility(xs, ys, batch_size)
 
@@ -463,19 +457,11 @@ class IntegratedDeepLIFT(GradientBasedMethod): #shapes of self.Y and ys do not m
         results = []
 
         for x in xs: #for each example:
-            print(np.array(x).shape)
             self.baseline = np.zeros(xs.shape[1:])
-            print(np.array(self.baseline).shape)
             interpolation = [self.baseline + i/self.steps*(x - self.baseline) for i in range(self.steps+1)] #evenly-spaced steps ranging from baseline to example's input values
-            print(np.array(interpolation).shape)
             attribs = self._session_run(attributions, interpolation, ys, batch_size)[0] #run attributions with all steps of interpolation at once
             gradient = np.sum(np.array(attribs[1:]), axis=0) #ignore 1st step, which uses baseline as input
             results.append(gradient * (x - self.baseline)/self.steps) #result is sum of all (gradient * change in step)
-
-        results = [g * (x - b) / self.steps for g, x, b in zip(
-            gradient,
-            xs if self.has_multiple_inputs else [xs],
-            self.baseline if self.has_multiple_inputs else [self.baseline])]
 
         return results
 
@@ -654,7 +640,8 @@ attribution_methods = OrderedDict({
     'deeplift': (DeepLIFTRescale, 5),
     'occlusion': (Occlusion, 6),
     'shapley_sampling': (ShapleySampling, 7),
-    'integdeeplift': (IntegratedDeepLIFT_v2, 8)
+    'integdeeplift': (IntegratedDeepLIFT_v2, 8),
+    'idl': (IntegratedDeepLIFT, 9)
 })
 
 
