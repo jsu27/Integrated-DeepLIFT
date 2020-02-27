@@ -385,7 +385,6 @@ class IntegratedDeepLIFT_v2(GradientBasedMethod):
     _deeplift_ref = {}
 
     def __init__(self, T, X, session, keras_learning_phase, steps=100, baseline=None):
-        #baseline, init refs, explain symbolic should all be done
         self.baseline = baseline
         self.steps = steps
         super(IntegratedDeepLIFT_v2, self).__init__(T, X, session, keras_learning_phase)
@@ -409,7 +408,7 @@ class IntegratedDeepLIFT_v2(GradientBasedMethod):
         return results[0] if not self.has_multiple_inputs else results
 
     @classmethod
-    def nonlinearity_grad_override(cls, op, grad): #update: have to update deeplift_ref to be the curr input
+    def nonlinearity_grad_override(cls, op, grad):
         output = op.outputs[0]
         input = op.inputs[0]
         ref_input = cls._deeplift_ref[op.name]
@@ -417,11 +416,12 @@ class IntegratedDeepLIFT_v2(GradientBasedMethod):
         delta_out = output - ref_output
         delta_in = input - ref_input
         instant_grad = activation(op.type)(0.5 * (ref_input + input))
-
-        cls._deeplift_ref[op.name] = input #based on interpolation, curr input is next ref_input
-
-        return tf.where(tf.abs(delta_in) > 1e-5, grad * delta_out / delta_in,
+        #compute before you update ref
+        ans = tf.where(tf.abs(delta_in) > 1e-5, grad * delta_out / delta_in,
                         original_grad(instant_grad.op, grad))
+        #based on interpolation, curr input is next ref_input
+        cls._deeplift_ref[op.name] = input
+        return ans
 
     def _init_references(self):
         # print ('DeepLIFT: computing references...')
@@ -445,7 +445,6 @@ class IntegratedDeepLIFT(GradientBasedMethod): #shapes of self.Y and ys do not m
 
     _deeplift_ref = {}
     def __init__(self, T, X, session, keras_learning_phase, steps=100, baseline=None):
-        #baseline, init refs, explain symbolic should all be done
         self.baseline = baseline
         self.steps = steps
         super(IntegratedDeepLIFT, self).__init__(T, X, session, keras_learning_phase)
@@ -453,13 +452,12 @@ class IntegratedDeepLIFT(GradientBasedMethod): #shapes of self.Y and ys do not m
     def run(self, xs, ys=None, batch_size=None):
         self._check_input_compatibility(xs, ys, batch_size)
 
-        attributions = self.explain_symbolic() #self.get_symbolic_attribution() #gradient delT/delX
         results = []
 
         for x in xs: #for each example:
             self.baseline = np.zeros(xs.shape[1:])
             interpolation = [self.baseline + i/self.steps*(x - self.baseline) for i in range(self.steps+1)] #evenly-spaced steps ranging from baseline to example's input values
-            attribs = self._session_run(attributions, interpolation, ys, batch_size)[0] #run attributions with all steps of interpolation at once
+            attribs = self._session_run(self.explain_symbolic(), interpolation, ys, batch_size)[0] #run attributions with all steps of interpolation at once
             gradient = np.sum(np.array(attribs[1:]), axis=0) #ignore 1st step, which uses baseline as input
             results.append(gradient * (x - self.baseline)/self.steps) #result is sum of all (gradient * change in step)
 
@@ -485,6 +483,74 @@ class IntegratedDeepLIFT(GradientBasedMethod): #shapes of self.Y and ys do not m
         return tf.where(tf.abs(delta_in) > 1e-5, grad * delta_out / delta_in,
                                original_grad(instant_grad.op, grad))
 
+
+class IntegratedDeepLIFT_true(GradientBasedMethod):
+    _deeplift_ref = {}
+
+    def __init__(self, T, X, session, keras_learning_phase, steps=100, baseline=None):
+        #baseline, init refs, explain symbolic should all be done
+        self.baseline = baseline
+        self.steps = steps
+        super(IntegratedDeepLIFT_true, self).__init__(T, X, session, keras_learning_phase)
+
+    def run(self, xs, ys=None, batch_size=None):
+        self._check_input_compatibility(xs, ys, batch_size)
+
+        gradient = None
+        xs_mod_baseline = self.baseline
+        for alpha in list(np.linspace(1. / self.steps, 1.0, self.steps)):
+            xs_mod = [b + (x - b) * alpha for x, b in zip(xs, self.baseline)] if self.has_multiple_inputs \
+                else self.baseline + (xs - self.baseline) * alpha
+
+            _attr = self._session_run(self.explain_symbolic(), xs_mod, ys, batch_size)
+            if gradient is None: gradient = _attr
+            else: gradient = [g + a for g, a in zip(gradient, _attr)]
+            xs_mod_baseline = xs_mod
+            #update references
+            self._init_references_input(xs_mod)
+
+
+        results = [g * (x - b) / self.steps for g, x, b in zip(
+            gradient,
+            xs if self.has_multiple_inputs else [xs],
+            self.baseline if self.has_multiple_inputs else [self.baseline])]
+
+        return results[0] if not self.has_multiple_inputs else results
+
+    @classmethod
+    def nonlinearity_grad_override(cls, op, grad): #update: have to update deeplift_ref to be the curr input
+        output = op.outputs[0]
+        input = op.inputs[0]
+        ref_input = cls._deeplift_ref[op.name]
+        ref_output = activation(op.type)(ref_input)
+        delta_out = output - ref_output
+        delta_in = input - ref_input
+        instant_grad = activation(op.type)(0.5 * (ref_input + input))
+
+        ans = tf.where(tf.abs(delta_in) > 1e-5, grad * delta_out / delta_in,
+                        original_grad(instant_grad.op, grad)) #compute before you update ref
+        cls._deeplift_ref[op.name] = input #based on interpolation, curr input is next ref_input
+        return ans
+
+    def _init_references(self):
+        # print ('DeepLIFT: computing references...')
+        self._init_references(self.baseline)
+
+    def _init_references_input(self, xs):
+        # print ('DeepLIFT: computing references...')
+        sys.stdout.flush()
+        self._deeplift_ref.clear()
+        ops = []
+        g = tf.get_default_graph()
+        for op in g.get_operations():
+            if len(op.inputs) > 0 and not op.name.startswith('gradients'):
+                if op.type in SUPPORTED_ACTIVATIONS:
+                    ops.append(op)
+        YR = self._session_run([o.inputs[0] for o in ops], xs)
+        for (r, op) in zip(YR, ops):
+            self._deeplift_ref[op.name] = r
+        # print('DeepLIFT: references ready')
+        sys.stdout.flush()
 
 """
 Occlusion method
@@ -641,7 +707,8 @@ attribution_methods = OrderedDict({
     'occlusion': (Occlusion, 6),
     'shapley_sampling': (ShapleySampling, 7),
     'integdeeplift': (IntegratedDeepLIFT_v2, 8),
-    'idl': (IntegratedDeepLIFT, 9)
+    'idl': (IntegratedDeepLIFT, 9),
+    'idl_true': (IntegratedDeepLIFT_true, 10)
 })
 
 
