@@ -483,7 +483,8 @@ class IntegratedDeepLIFT(GradientBasedMethod): #shapes of self.Y and ys do not m
         return tf.where(tf.abs(delta_in) > 1e-5, grad * delta_out / delta_in,
                                original_grad(instant_grad.op, grad))
 
-
+# potential problem: self.gradients is cached and will not reload; so old values of deeplift_ref are cached there??? ie gradient constant values perfectly preserved
+# Solution?: ?? wait idk. Feed things???
 class IntegratedDeepLIFT_true(GradientBasedMethod):
     _deeplift_ref = {}
 
@@ -495,30 +496,35 @@ class IntegratedDeepLIFT_true(GradientBasedMethod):
 
     def run(self, xs, ys=None, batch_size=None):
         self._check_input_compatibility(xs, ys, batch_size)
-
+        self._init_references()
         gradient = None
-        xs_mod_baseline = self.baseline
         for alpha in list(np.linspace(1. / self.steps, 1.0, self.steps)):
             xs_mod = [b + (x - b) * alpha for x, b in zip(xs, self.baseline)] if self.has_multiple_inputs \
                 else self.baseline + (xs - self.baseline) * alpha
-
+            print("alpha")
+            print(alpha)
+            print('xs_mod')
+            print(xs_mod)
             _attr = self._session_run(self.explain_symbolic(), xs_mod, ys, batch_size)
+            print("attr:")
+            print(_attr)
             if gradient is None: gradient = _attr
             else: gradient = [g + a for g, a in zip(gradient, _attr)]
-            xs_mod_baseline = xs_mod
             #update references
             self._init_references_input(xs_mod)
 
-
+        print("grads")
+        print(gradient)
         results = [g * (x - b) / self.steps for g, x, b in zip(
             gradient,
             xs if self.has_multiple_inputs else [xs],
             self.baseline if self.has_multiple_inputs else [self.baseline])]
-
+        print("results")
+        print(results[0])
         return results[0] if not self.has_multiple_inputs else results
 
     @classmethod
-    def nonlinearity_grad_override(cls, op, grad): #update: have to update deeplift_ref to be the curr input
+    def nonlinearity_grad_override(cls, op, grad):
         output = op.outputs[0]
         input = op.inputs[0]
         ref_input = cls._deeplift_ref[op.name]
@@ -526,15 +532,23 @@ class IntegratedDeepLIFT_true(GradientBasedMethod):
         delta_out = output - ref_output
         delta_in = input - ref_input
         instant_grad = activation(op.type)(0.5 * (ref_input + input))
-
-        ans = tf.where(tf.abs(delta_in) > 1e-5, grad * delta_out / delta_in,
-                        original_grad(instant_grad.op, grad)) #compute before you update ref
-        cls._deeplift_ref[op.name] = input #based on interpolation, curr input is next ref_input
-        return ans
+        result = tf.where(tf.abs(delta_in) > 1e-5, grad * delta_out / delta_in,
+                        original_grad(instant_grad.op, grad))
+        testing = True
+        if testing:
+            print('GRAD')
+            print('output', output)
+            print('input', input)
+            print('ref_input', ref_input)
+            print('ref_output', ref_output)
+            print('delta_out', delta_out)
+            print('delta_in', delta_in)
+            print('result', result)
+        return result
 
     def _init_references(self):
         # print ('DeepLIFT: computing references...')
-        self._init_references(self.baseline)
+        self._init_references_input(self.baseline)
 
     def _init_references_input(self, xs):
         # print ('DeepLIFT: computing references...')
@@ -549,7 +563,8 @@ class IntegratedDeepLIFT_true(GradientBasedMethod):
         YR = self._session_run([o.inputs[0] for o in ops], xs)
         for (r, op) in zip(YR, ops):
             self._deeplift_ref[op.name] = r
-        # print('DeepLIFT: references ready')
+        print('DeepLIFT: references ready')
+        print(self._deeplift_ref)
         sys.stdout.flush()
 
 """
