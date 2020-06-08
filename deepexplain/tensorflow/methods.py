@@ -548,10 +548,6 @@ class IntegratedDeepLIFT_true(GradientBasedMethod):
 
     def _init_references(self):
         # print ('DeepLIFT: computing references...')
-        self._init_references_input(self.baseline)
-
-    def _init_references_input(self, xs):
-        # print ('DeepLIFT: computing references...')
         sys.stdout.flush()
         self._deeplift_ref.clear()
         ops = []
@@ -560,9 +556,41 @@ class IntegratedDeepLIFT_true(GradientBasedMethod):
             if len(op.inputs) > 0 and not op.name.startswith('gradients'):
                 if op.type in SUPPORTED_ACTIVATIONS:
                     ops.append(op)
-        YR = self._session_run([o.inputs[0] for o in ops], xs)
+        YR = self._session_run([o.inputs[0] for o in ops], self.baseline)
+        print(YR)
+        print('OPS')
         for (r, op) in zip(YR, ops):
-            self._deeplift_ref[op.name] = r
+            print(op.name)
+            print(r)
+            self._deeplift_ref[op.name] = tf.Variable(r) # create Variable
+            self._deeplift_ref[op.name].load(r, self.session)
+        # self.session.run(tf.global_variables_initializer())
+        print('DeepLIFT: references ready')
+        print(self._deeplift_ref)
+        sys.stdout.flush()
+
+    def _init_references_input(self, xs):
+        # print ('DeepLIFT: computing references...')
+        sys.stdout.flush()
+        # self._deeplift_ref.clear()
+        ops = []
+        g = tf.get_default_graph()
+        for op in g.get_operations():
+            if len(op.inputs) > 0 and not op.name.startswith('gradients'):
+                if op.type in SUPPORTED_ACTIVATIONS:
+                    ops.append(op)
+        YR = self._session_run([o.inputs[0] for o in ops], xs)
+        print(YR)
+        print('OPS')
+        for (r, op) in zip(YR, ops):
+            print(op.name)
+            print(r)
+            if op.name in self._deeplift_ref: # check if op already present
+                print('ALREADY CONTAINED')
+                self._deeplift_ref[op.name].load(r, self.session)
+            else:
+                print('NOT PRESENT')
+                self._deeplift_ref[op.name] = tf.Variable(r)
         print('DeepLIFT: references ready')
         print(self._deeplift_ref)
         sys.stdout.flush()
