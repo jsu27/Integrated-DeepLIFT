@@ -488,14 +488,6 @@ class IntegratedDeepLIFT(GradientBasedMethod): #shapes of self.Y and ys do not m
 class IntegratedDeepLIFT_true(GradientBasedMethod):
     _deeplift_ref = {}
 
-    def get_symbolic_attribution(self):
-        return tf.gradients(self.T, self.X)
-
-    def explain_symbolic(self):
-        if self.symbolic_attribution is None:
-            self.symbolic_attribution = self.get_symbolic_attribution()
-        return self.symbolic_attribution
-
     def __init__(self, T, X, session, keras_learning_phase, steps=100, baseline=None):
         #baseline, init refs, explain symbolic should all be done
         self.baseline = baseline
@@ -512,20 +504,14 @@ class IntegratedDeepLIFT_true(GradientBasedMethod):
         for alpha in list(np.linspace(1. / self.steps, 1.0, self.steps)):
             xs_mod = [b + (x - b) * alpha for x, b in zip(xs, self.baseline)] if self.has_multiple_inputs \
                 else self.baseline + (xs - self.baseline) * alpha
-            print("alpha")
-            print(alpha)
-            print('xs_mod')
-            print(xs_mod)
+
             _attr = self._session_run(self.explain_symbolic(), xs_mod, ys, batch_size)
-            print("attr:")
-            print(_attr)
+
             if gradient is None: gradient = _attr
             else: gradient = [g + a for g, a in zip(gradient, _attr)]
             #update references
             self._init_references_input(xs_mod)
 
-        print("grads")
-        print(gradient)
         results = [g * (x - b) / self.steps for g, x, b in zip(
             gradient,
             xs if self.has_multiple_inputs else [xs],
@@ -543,19 +529,12 @@ class IntegratedDeepLIFT_true(GradientBasedMethod):
         delta_out = output - ref_output
         delta_in = input - ref_input
         instant_grad = activation(op.type)(0.5 * (ref_input + input))
-        # result = tf.where(tf.abs(delta_in) > 1e-5, grad * delta_out / delta_in,
-        #                 original_grad(instant_grad.op, grad))
-        testing = True
+
+        testing = False
         if testing:
 
             print('GRAD')
             p1 = tf.print(('output', output))
-            # p1 print('input', input)
-            # print('ref_input', ref_input)
-            # print('ref_output', ref_output)
-            # print('delta_out', delta_out)
-            # print('delta_in', delta_in)
-            # print('result', result)
             p2 = tf.print(('input',input))
             p3 = tf.print(('ref_input',ref_input))
             p4 = tf.print(('ref_output',ref_output))
@@ -564,10 +543,11 @@ class IntegratedDeepLIFT_true(GradientBasedMethod):
             print("printing python id of ref_input")
             print(id(ref_input))
             to_print = tf.print((('output', output), ('input',input),('ref_input',ref_input),  ('ref_output',ref_output),('delta_out',delta_out), ('delta_in',delta_in)))
-            #p7 = tf.print(result)
 
             with tf.control_dependencies([to_print]):
                 result = tf.where(tf.abs(delta_in) > 1e-5, grad * delta_out / delta_in, original_grad(instant_grad.op, grad))
+        else:
+            result = tf.where(tf.abs(delta_in) > 1e-5, grad * delta_out / delta_in, original_grad(instant_grad.op, grad))
         return result
 
     def _init_references(self):
@@ -581,16 +561,14 @@ class IntegratedDeepLIFT_true(GradientBasedMethod):
                 if op.type in SUPPORTED_ACTIVATIONS:
                     ops.append(op)
         YR = self._session_run([o.inputs[0] for o in ops], self.baseline)
-        print(YR)
-        print('OPS')
         for (r, op) in zip(YR, ops):
-            print(op.name)
-            print("value of reference to set:", r)
+            # print(op.name)
+            # print("value of reference to set:", r)
             self._deeplift_ref[op.name] = tf.Variable(r) # create Variable
             #self._deeplift_ref[op.name].load(r, self.session)
         # self.session.run(tf.global_variables_initializer())
-        print('DeepLIFT: references ready')
-        print(self._deeplift_ref)
+        # print('DeepLIFT: references ready')
+        # print(self._deeplift_ref)
         sys.stdout.flush()
 
     def _init_references_input(self, xs):
@@ -611,12 +589,13 @@ class IntegratedDeepLIFT_true(GradientBasedMethod):
             print("value of reference to set:", r)
             if op.name in self._deeplift_ref: # check if op already present
                 #print('ALREADY CONTAINED')
-                print("setting", op.name)
-                print( self.session.run(self._deeplift_ref[op.name].assign(r)) )#, self.session)
-                print("checking if value updated")
-                print( self.session.run(self._deeplift_ref[op.name] ) )
-                print("printing python id of _deeplift_ref op")
-                print(id(self._deeplift_ref[op.name]))
+                # print("setting", op.name)
+                # print( self.session.run(self._deeplift_ref[op.name].assign(r)) )#, self.session)
+                # print("checking if value updated")
+                # print( self.session.run(self._deeplift_ref[op.name] ) )
+                # print("printing python id of _deeplift_ref op")
+                # print(id(self._deeplift_ref[op.name]))
+                self._deeplift_ref[op.name].load(r, self.session)
 
             else:
                 print('NOT PRESENT')
