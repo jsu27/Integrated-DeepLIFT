@@ -582,11 +582,11 @@ class IntegratedDeepLIFT_true(GradientBasedMethod):
                 if op.type in SUPPORTED_ACTIVATIONS:
                     ops.append(op)
         YR = self._session_run([o.inputs[0] for o in ops], xs)
-        print(YR)
-        print('OPS')
+        # print(YR)
+        # print('OPS')
         for (r, op) in zip(YR, ops):
-            print(op.name)
-            print("value of reference to set:", r)
+            # print(op.name)
+            # print("value of reference to set:", r)
             if op.name in self._deeplift_ref: # check if op already present
                 #print('ALREADY CONTAINED')
                 # print("setting", op.name)
