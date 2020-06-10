@@ -211,7 +211,9 @@ class GradientBasedMethod(AttributionMethod):
 
     def run(self, xs, ys=None, batch_size=None):
         self._check_input_compatibility(xs, ys, batch_size)
+        print(xs.shape)
         results = self._session_run(self.explain_symbolic(), xs, ys, batch_size)
+        print(np.array(results).shape)
         return results[0] if not self.has_multiple_inputs else results
 
     @classmethod
@@ -347,11 +349,28 @@ class DeepLIFTRescale(GradientBasedMethod):
         self.baseline = baseline
         super(DeepLIFTRescale, self).__init__(T, X, session, keras_learning_phase)
 
+        # blah = tf.gradients(self.T, self.X)
+        # print('still in init')
+
     def get_symbolic_attribution(self):
         return [g * (x - b) for g, x, b in zip(
             tf.gradients(self.T, self.X),
             self.X if self.has_multiple_inputs else [self.X],
             self.baseline if self.has_multiple_inputs else [self.baseline])]
+        # return 0
+    #
+    # # Testing gradient override in instance method
+    # def run(self, xs, ys=None, batch_size=None):
+    #     self._check_input_compatibility(xs, ys, batch_size)
+    #     grads = tf.gradients(self.T, self.X)
+    #     attribs = [g * (x - b) for g, x, b in zip(
+    #         grads,
+    #         self.X if self.has_multiple_inputs else [self.X],
+    #         self.baseline if self.has_multiple_inputs else [self.baseline])]
+    #     results = self._session_run(attribs, xs, ys, batch_size)
+    #     return results[0] if not self.has_multiple_inputs else results
+    #
+
 
     @classmethod
     def nonlinearity_grad_override(cls, op, grad):
@@ -362,6 +381,7 @@ class DeepLIFTRescale(GradientBasedMethod):
         delta_out = output - ref_output
         delta_in = input - ref_input
         instant_grad = activation(op.type)(0.5 * (ref_input + input))
+        # print("IN GRAD OVERRIDE")
         return tf.where(tf.abs(delta_in) > 1e-5, grad * delta_out / delta_in,
                         original_grad(instant_grad.op, grad))
 
@@ -491,12 +511,44 @@ class IntegratedDeepLIFT_true(GradientBasedMethod):
     def __init__(self, T, X, session, keras_learning_phase, steps=100, baseline=None):
         #baseline, init refs, explain symbolic should all be done
         self.baseline = baseline
+        self.expanded_baseline = None
         self.steps = steps
-        super(IntegratedDeepLIFT_true, self).__init__(T, X, session, keras_learning_phase)
+
+        self.T = T  # target Tensor
+        self.X = X  # input Tensor
+        self.Y_shape = [None,] + T.get_shape().as_list()[1:]
+        # Most often T contains multiple output units. In this case, it is often necessary to select
+        # a single unit to compute contributions for. This can be achieved passing 'ys' as weight for the output Tensor.
+        self.Y = tf.placeholder(tf.float32, self.Y_shape)
+        # placeholder_from_data(ys) if ys is not None else 1.0  # Tensor that represents weights for T
+        self.T = self.T * self.Y
+        self.symbolic_attribution = None
+        self.session = session
+        self.keras_learning_phase = keras_learning_phase
+        self.has_multiple_inputs = type(self.X) is list or type(self.X) is tuple
+        logging.info('Model with multiple inputs: %s' % self.has_multiple_inputs)
+
+        # Set baseline
+        # TODO: now this sets a baseline also for those methods that does not require it
+        self._set_check_baseline()
+
+        # References
+        # self._init_references()
+
+        # Create symbolic explanation once during construction (affects only gradient-based methods)
+        # self.explain_symbolic()
+        # super(IntegratedDeepLIFT_true, self).__init__(T, X, session, keras_learning_phase)
 
     def run(self, xs, ys=None, batch_size=None):
+
+
         self._check_input_compatibility(xs, ys, batch_size)
-        # self._init_references()
+
+        self.expanded_baseline = np.broadcast_to(self.baseline[0], (xs.shape[0],) + self.baseline.shape[1:])
+        print(self.expanded_baseline.shape)
+        # do this after size of input is known
+        self._init_references()
+        self.explain_symbolic()
 
         self.session.run(tf.initialize_variables(self._deeplift_ref.values()))
 
@@ -560,7 +612,7 @@ class IntegratedDeepLIFT_true(GradientBasedMethod):
             if len(op.inputs) > 0 and not op.name.startswith('gradients'):
                 if op.type in SUPPORTED_ACTIVATIONS:
                     ops.append(op)
-        YR = self._session_run([o.inputs[0] for o in ops], self.baseline)
+        YR = self._session_run([o.inputs[0] for o in ops], self.expanded_baseline)
         for (r, op) in zip(YR, ops):
             # print(op.name)
             # print("value of reference to set:", r)
@@ -950,14 +1002,17 @@ class DeepExplain(object):
             warnings.warn('DeepExplain detected you are trying to use an attribution method that requires '
                           'gradient override but the original gradient was used instead. You might have forgot to '
                           '(re)create your graph within the DeepExlain context. Results are not reliable!')
-        _ENABLED_METHOD_CLASS = None
+        # commented out, otherwise gradient override will be called once Method is constructed
+        # _ENABLED_METHOD_CLASS = None
         _GRAD_OVERRIDE_CHECKFLAG = 0
         self.keras_phase_placeholder = None
         return method
 
     def explain(self, method, T, X, xs, ys=None, batch_size=None, **kwargs):
         explainer = self.get_explainer(method, T, X, **kwargs)
-        return explainer.run(xs, ys, batch_size)
+        result = explainer.run(xs, ys, batch_size)
+        print(np.array(result).shape)
+        return result
 
     @staticmethod
     def get_override_map():
