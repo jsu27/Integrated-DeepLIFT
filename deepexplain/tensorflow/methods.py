@@ -306,6 +306,23 @@ class IntegratedGradients(GradientBasedMethod):
 
         return results[0] if not self.has_multiple_inputs else results
 
+# "perpendicular" implementation of IG, iterating over each sample instead of each step
+class IntegratedGradients_new(GradientBasedMethod):
+    def __init__(self, T, X, session, keras_learning_phase, steps=100, baseline=None):
+        self.steps = steps
+        self.baseline = baseline
+        super(IntegratedGradients_new, self).__init__(T, X, session, keras_learning_phase)
+
+    def run(self, xs, ys=None, batch_size=None):
+        self._check_input_compatibility(xs, ys, batch_size)
+        results = []
+        for x in xs:
+            interpolation = [self.baseline[0] + i/self.steps*(x - self.baseline[0]) for i in range(self.steps+1)]
+            attribs = self._session_run(self.explain_symbolic(), interpolation, ys, batch_size)[0]
+            gradient = np.sum(np.array(attribs[1:]), axis=0) #ignore 1st step which is baseline
+            results.append(gradient * (x - self.baseline[0])/self.steps)
+
+        return results
 
 """
 Layer-wise Relevance Propagation with epsilon rule
@@ -504,7 +521,6 @@ class IntegratedDeepLIFT(GradientBasedMethod): #shapes of self.Y and ys do not m
                                original_grad(instant_grad.op, grad))
 
 # potential problem: self.gradients is cached and will not reload; so old values of deeplift_ref are cached there??? ie gradient constant values perfectly preserved
-# Solution?: ?? wait idk. Feed things???
 class IntegratedDeepLIFT_true(GradientBasedMethod):
     _deeplift_ref = {}
 
@@ -540,12 +556,10 @@ class IntegratedDeepLIFT_true(GradientBasedMethod):
         # super(IntegratedDeepLIFT_true, self).__init__(T, X, session, keras_learning_phase)
 
     def run(self, xs, ys=None, batch_size=None):
-
-
         self._check_input_compatibility(xs, ys, batch_size)
-
-        self.expanded_baseline = np.broadcast_to(self.baseline[0], (xs.shape[0],) + self.baseline.shape[1:])
-        print(self.expanded_baseline.shape)
+        # baseline to match n x input size
+        self.expanded_baseline = np.broadcast_to(self.baseline[0], xs.shape) # np.broadcast_to(self.baseline[0], (xs.shape[0],) + self.baseline.shape[1:])
+        # print(self.expanded_baseline.shape)
         # do this after size of input is known
         self._init_references()
         self.explain_symbolic()
@@ -568,8 +582,8 @@ class IntegratedDeepLIFT_true(GradientBasedMethod):
             gradient,
             xs if self.has_multiple_inputs else [xs],
             self.baseline if self.has_multiple_inputs else [self.baseline])]
-        print("results")
-        print(results[0])
+        # print("results")
+        # print(results[0])
         return results[0] if not self.has_multiple_inputs else results
 
     @classmethod
@@ -652,8 +666,8 @@ class IntegratedDeepLIFT_true(GradientBasedMethod):
             else:
                 print('NOT PRESENT')
                 self._deeplift_ref[op.name] = tf.Variable(r)
-        print('DeepLIFT: references ready')
-        print(self._deeplift_ref)
+        # print('DeepLIFT: references ready')
+        # print(self._deeplift_ref)
         sys.stdout.flush()
 
 
@@ -926,7 +940,8 @@ attribution_methods = OrderedDict({
     'shapley_sampling': (ShapleySampling, 7),
     'integdeeplift': (IntegratedDeepLIFT_v2, 8),
     'idl': (IntegratedDeepLIFT, 9),
-    'idl_true': (IntegratedDeepLIFT_true, 10)
+    'idl_true': (IntegratedDeepLIFT_true, 10),
+    'intgrad_new': (IntegratedGradients_new, 11)
 })
 
 
