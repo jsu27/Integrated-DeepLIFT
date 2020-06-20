@@ -13,7 +13,7 @@ from collections import OrderedDict
 from .utils import make_batches, slice_arrays, to_list, unpack_singleton, placeholder_from_data
 
 SUPPORTED_ACTIVATIONS = [
-    'Relu', 'Elu', 'Sigmoid', 'Tanh', 'Softplus'#, 'MaxPool'
+    'Relu', 'Elu', 'Sigmoid', 'Tanh', 'Softplus', 'MaxPool'
 ]
 
 UNSUPPORTED_ACTIVATIONS = [
@@ -391,7 +391,7 @@ class DeepLIFTRescale(GradientBasedMethod):
 
     @classmethod
     def nonlinearity_grad_override(cls, op, grad):
-        if False:#op.type == 'MaxPool':
+        if op.type == 'MaxPool':
 
             xout = op.outputs[0]
             input = op.inputs[0]
@@ -401,14 +401,15 @@ class DeepLIFTRescale(GradientBasedMethod):
 
             # dup0 = [2] + [1 for i in delta_in.shape[1:]]
             cross_max = tf.maximum(xout, rout)
-            diffs = tf.concat([cross_max - rout, xout - cross_max], 0)
+            # diffs = tf.concat([cross_max - rout, xout - cross_max], 0)
             # xmax_pos,rmax_pos = tf.split(original_grad(op, grad * diffs), 2) #
             diff1 = cross_max - rout
             diff2 = xout - cross_max
-            xmax_pos = original_grad(op, grad)#*diffs) #* diffs
-            rmax_pos = original_grad(op, grad)#*diffs) #* diffs
-
-            testing1 = True
+            tf.print(('diff1.shape', diff1.shape))
+            xmax_pos = original_grad(op, grad*diff1)#*diff1#*diffs) #* diffs
+            rmax_pos = original_grad(op, grad*diff2)#*diff2#*diffs) #* diffs
+            tf.print(('xmax_pos.shape', xmax_pos.shape))
+            testing1 = False
             if testing1:
 
                 print('printed')
@@ -420,19 +421,23 @@ class DeepLIFTRescale(GradientBasedMethod):
                 # print("printing python id of ref_input")
                 # print(id(ref_input))
                 # to_print = tf.print((('output', xout), ('input',input),('ref_input',ref_input),  ('ref_output',rout),('cross_max', cross_max), ('diff1', diff1), ('delta_in',delta_in), ('xmax_pos', xmax_pos), ('rmax_pos', rmax_pos)))
-                to_print = tf.print((('grad', grad), ('xmax_pos', xmax_pos), ('rmax_pos', rmax_pos)))
+                to_print = tf.print((('grad.shape', grad.shape), ('xmax_pos', xmax_pos), ('rmax_pos', rmax_pos), ('diff1.shape', diff1.shape),('xmax_pos.shape', xmax_pos.shape) ))
 
                 with tf.control_dependencies([to_print]):
                     result = tf.where(
-                        tf.abs(delta_in) < 1e-7,
+                        tf.abs(delta_in) < 1e-5,
                         tf.zeros_like(delta_in),
                         (xmax_pos + rmax_pos) / delta_in
                     )
                     return result
             # return
-            return grad * (xout-rout)/delta_in
+            return tf.where(
+                tf.abs(delta_in) < 1e-5,
+                tf.zeros_like(delta_in),
+                (xmax_pos + rmax_pos) / delta_in
+            )
 
-            
+
         output = op.outputs[0]
         input = op.inputs[0]
         ref_input = cls._deeplift_ref[op.name]
@@ -459,7 +464,7 @@ class DeepLIFTRescale(GradientBasedMethod):
             with tf.control_dependencies([to_print]):
                 result = tf.where(tf.abs(delta_in) > 1e-5, grad * delta_out / delta_in, original_grad(instant_grad.op, grad))
         else:
-            result = grad * delta_out / delta_in
+            result = tf.where(tf.abs(delta_in) > 1e-5, grad * delta_out / delta_in, original_grad(instant_grad.op, grad))
             # result = tf.where(tf.abs(delta_in) > 1e-5, grad * delta_out / delta_in, original_grad(instant_grad.op, grad))
         return result
         #return tf.where(tf.abs(delta_in) > 1e-5, grad * delta_out / delta_in,
