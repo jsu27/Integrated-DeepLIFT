@@ -13,7 +13,7 @@ from collections import OrderedDict
 from .utils import make_batches, slice_arrays, to_list, unpack_singleton, placeholder_from_data
 
 SUPPORTED_ACTIVATIONS = [
-    'Relu', 'Elu', 'Sigmoid', 'Tanh', 'Softplus'
+    'Relu', 'Elu', 'Sigmoid', 'Tanh', 'Softplus'#, 'MaxPool'
 ]
 
 UNSUPPORTED_ACTIVATIONS = [
@@ -361,7 +361,7 @@ https://arxiv.org/abs/1704.02685
 class DeepLIFTRescale(GradientBasedMethod):
 
     _deeplift_ref = {}
-
+    _deeplift_ref_out = {}
     def __init__(self, T, X, session, keras_learning_phase, baseline=None):
         self.baseline = baseline
         super(DeepLIFTRescale, self).__init__(T, X, session, keras_learning_phase)
@@ -391,6 +391,48 @@ class DeepLIFTRescale(GradientBasedMethod):
 
     @classmethod
     def nonlinearity_grad_override(cls, op, grad):
+        if False:#op.type == 'MaxPool':
+
+            xout = op.outputs[0]
+            input = op.inputs[0]
+            ref_input = cls._deeplift_ref[op.name]
+            rout = cls._deeplift_ref_out[op.name]#
+            delta_in = input - ref_input
+
+            # dup0 = [2] + [1 for i in delta_in.shape[1:]]
+            cross_max = tf.maximum(xout, rout)
+            diffs = tf.concat([cross_max - rout, xout - cross_max], 0)
+            # xmax_pos,rmax_pos = tf.split(original_grad(op, grad * diffs), 2) #
+            diff1 = cross_max - rout
+            diff2 = xout - cross_max
+            xmax_pos = original_grad(op, grad)#*diffs) #* diffs
+            rmax_pos = original_grad(op, grad)#*diffs) #* diffs
+
+            testing1 = True
+            if testing1:
+
+                print('printed')
+                p1 = tf.print(('xout', xout))
+                p2 = tf.print(('input',input))
+                p3 = tf.print(('ref_input',ref_input))
+                p4 = tf.print(('rout',rout))
+                p6 = tf.print(('delta_in',delta_in))
+                # print("printing python id of ref_input")
+                # print(id(ref_input))
+                # to_print = tf.print((('output', xout), ('input',input),('ref_input',ref_input),  ('ref_output',rout),('cross_max', cross_max), ('diff1', diff1), ('delta_in',delta_in), ('xmax_pos', xmax_pos), ('rmax_pos', rmax_pos)))
+                to_print = tf.print((('grad', grad), ('xmax_pos', xmax_pos), ('rmax_pos', rmax_pos)))
+
+                with tf.control_dependencies([to_print]):
+                    result = tf.where(
+                        tf.abs(delta_in) < 1e-7,
+                        tf.zeros_like(delta_in),
+                        (xmax_pos + rmax_pos) / delta_in
+                    )
+                    return result
+            # return
+            return grad * (xout-rout)/delta_in
+
+            
         output = op.outputs[0]
         input = op.inputs[0]
         ref_input = cls._deeplift_ref[op.name]
@@ -399,13 +441,35 @@ class DeepLIFTRescale(GradientBasedMethod):
         delta_in = input - ref_input
         instant_grad = activation(op.type)(0.5 * (ref_input + input))
         # print("IN GRAD OVERRIDE")
-        return tf.where(tf.abs(delta_in) > 1e-5, grad * delta_out / delta_in,
-                        original_grad(instant_grad.op, grad))
+        testing = False
+        if testing:
+
+            print('GRAD')
+            p1 = tf.print(('output', output))
+            p2 = tf.print(('input',input))
+            p3 = tf.print(('ref_input',ref_input))
+            p4 = tf.print(('ref_output',ref_output))
+            p5 = tf.print(('delta_out',delta_out))
+            p6 = tf.print(('delta_in',delta_in))
+            tf.print(('delta_in',delta_in))
+            print("printing python id of ref_input")
+            print(id(ref_input))
+            to_print = tf.print((('output', output), ('input',input),('ref_input',ref_input),  ('ref_output',ref_output),('delta_out',delta_out), ('delta_in',delta_in)))
+
+            with tf.control_dependencies([to_print]):
+                result = tf.where(tf.abs(delta_in) > 1e-5, grad * delta_out / delta_in, original_grad(instant_grad.op, grad))
+        else:
+            result = grad * delta_out / delta_in
+            # result = tf.where(tf.abs(delta_in) > 1e-5, grad * delta_out / delta_in, original_grad(instant_grad.op, grad))
+        return result
+        #return tf.where(tf.abs(delta_in) > 1e-5, grad * delta_out / delta_in,
+        #                original_grad(instant_grad.op, grad))
 
     def _init_references(self):
         # print ('DeepLIFT: computing references...')
         sys.stdout.flush()
         self._deeplift_ref.clear()
+        self._deeplift_ref_out.clear()
         ops = []
         g = tf.get_default_graph()
         for op in g.get_operations():
@@ -413,8 +477,11 @@ class DeepLIFTRescale(GradientBasedMethod):
                 if op.type in SUPPORTED_ACTIVATIONS:
                     ops.append(op)
         YR = self._session_run([o.inputs[0] for o in ops], self.baseline)
+        activs = self._session_run([o.outputs[0] for o in ops], self.baseline)
         for (r, op) in zip(YR, ops):
             self._deeplift_ref[op.name] = r
+        for (r, op) in zip(activs, ops):
+            self._deeplift_ref_out[op.name] = r
         # print('DeepLIFT: references ready')
         sys.stdout.flush()
 
@@ -1005,7 +1072,7 @@ class DeepExplain(object):
 
         logging.info('DeepExplain: running "%s" explanation method (%d)' % (self.method, method_flag))
         self._check_ops()
-        _GRAD_OVERRIDE_CHECKFLAG = 0
+        _GRAD_OVERRIDE_CHECKFLAG = 1 # modified?
 
         _ENABLED_METHOD_CLASS = method_class
         method = _ENABLED_METHOD_CLASS(T, X,
@@ -1017,8 +1084,8 @@ class DeepExplain(object):
             warnings.warn('DeepExplain detected you are trying to use an attribution method that requires '
                           'gradient override but the original gradient was used instead. You might have forgot to '
                           '(re)create your graph within the DeepExlain context. Results are not reliable!')
-        # commented out, otherwise gradient override will be called once Method is constructed
-        # _ENABLED_METHOD_CLASS = None
+        # commented out, otherwise gradient override will be called once Method is constructed, and then turn off (?)
+        _ENABLED_METHOD_CLASS = None
         _GRAD_OVERRIDE_CHECKFLAG = 0
         self.keras_phase_placeholder = None
         return method
