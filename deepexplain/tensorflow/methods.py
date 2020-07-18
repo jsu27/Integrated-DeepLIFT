@@ -370,6 +370,7 @@ class DeepLIFTRescale(GradientBasedMethod):
         # print('still in init')
 
     def get_symbolic_attribution(self):
+        print('get symbolic')
         return [g * (x - b) for g, x, b in zip(
             tf.gradients(self.T, self.X),
             self.X if self.has_multiple_inputs else [self.X],
@@ -392,23 +393,19 @@ class DeepLIFTRescale(GradientBasedMethod):
     @classmethod
     def nonlinearity_grad_override(cls, op, grad):
         if op.type == 'MaxPool':
-
+            print('in maxpool')
             xout = op.outputs[0]
             input = op.inputs[0]
             ref_input = cls._deeplift_ref[op.name]
             rout = cls._deeplift_ref_out[op.name]#
             delta_in = input - ref_input
 
-            # dup0 = [2] + [1 for i in delta_in.shape[1:]]
             cross_max = tf.maximum(xout, rout)
-            # diffs = tf.concat([cross_max - rout, xout - cross_max], 0)
-            # xmax_pos,rmax_pos = tf.split(original_grad(op, grad * diffs), 2) #
             diff1 = cross_max - rout
             diff2 = xout - cross_max
-            tf.print(('diff1.shape', diff1.shape))
-            xmax_pos = original_grad(op, grad*diff1)#*diff1#*diffs) #* diffs
-            rmax_pos = original_grad(op, grad*diff2)#*diff2#*diffs) #* diffs
-            tf.print(('xmax_pos.shape', xmax_pos.shape))
+            xmax_pos = original_grad(op, grad*diff1)
+            rmax_pos = original_grad(op, grad*diff2)
+
             testing1 = False
             if testing1:
 
@@ -432,7 +429,7 @@ class DeepLIFTRescale(GradientBasedMethod):
                     return result
             # return
             return tf.where(
-                tf.abs(delta_in) < 1e-5,
+                tf.abs(delta_in) < 1e-5, # 1e-5
                 tf.zeros_like(delta_in),
                 (xmax_pos + rmax_pos) / delta_in
             )
@@ -471,7 +468,7 @@ class DeepLIFTRescale(GradientBasedMethod):
         #                original_grad(instant_grad.op, grad))
 
     def _init_references(self):
-        # print ('DeepLIFT: computing references...')
+        print ('DeepLIFT: computing references...')
         sys.stdout.flush()
         self._deeplift_ref.clear()
         self._deeplift_ref_out.clear()
@@ -575,6 +572,51 @@ class IntegratedDeepLIFT(GradientBasedMethod): #shapes of self.Y and ys do not m
 
     @classmethod
     def nonlinearity_grad_override(cls, op, grad): #custom gradient for DeepLIFT multiplier
+        if op.type == 'blahblahMaxPool':
+            output = op.outputs[0]
+            input = op.inputs[0]
+            ref_input = tf.concat([input[0:1], input[0:-1]], axis=0) #input[0:1] is 1st component; input[0:-1] ranges from 1st to second-to-last component
+            ref_output = tf.concat([output[0:1], output[0:-1]], axis=0) #same logic
+            # ref_input = cls._deeplift_ref[op.name]
+            # rout = cls._deeplift_ref_out[op.name]#
+            delta_in = input - ref_input
+
+            # dup0 = [2] + [1 for i in delta_in.shape[1:]]
+            cross_max = tf.maximum(output, ref_output)
+            # diffs = tf.concat([cross_max - rout, xout - cross_max], 0)
+            # xmax_pos,rmax_pos = tf.split(original_grad(op, grad * diffs), 2) #
+            diff1 = cross_max - ref_output
+            diff2 = output - cross_max
+            xmax_pos = original_grad(op, grad*diff1)#*diff1#*diffs) #* diffs
+            rmax_pos = original_grad(op, grad*diff2)#*diff2#*diffs) #* diffs
+            testing1 = False
+            if testing1:
+
+                print('printed')
+                p1 = tf.print(('xout', output))
+                p2 = tf.print(('input',input))
+                p3 = tf.print(('ref_input',ref_input))
+                p4 = tf.print(('rout',ref_output))
+                p6 = tf.print(('delta_in',delta_in))
+                # print("printing python id of ref_input")
+                # print(id(ref_input))
+                # to_print = tf.print((('output', xout), ('input',input),('ref_input',ref_input),  ('ref_output',rout),('cross_max', cross_max), ('diff1', diff1), ('delta_in',delta_in), ('xmax_pos', xmax_pos), ('rmax_pos', rmax_pos)))
+                to_print = tf.print((('grad.shape', grad.shape), ('xmax_pos', xmax_pos), ('rmax_pos', rmax_pos), ('diff1.shape', diff1.shape),('xmax_pos.shape', xmax_pos.shape) ))
+
+                with tf.control_dependencies([to_print]):
+                    result = tf.where(
+                        tf.abs(delta_in) < 1e-5,
+                        tf.zeros_like(delta_in),
+                        (xmax_pos + rmax_pos) / delta_in
+                    )
+                    return result
+                # return
+            return tf.where(
+                tf.abs(delta_in) < 1e-2, # before 1e-5
+                tf.zeros_like(delta_in),
+                (xmax_pos + rmax_pos) / delta_in
+            )
+
         input = op.inputs[0] #inputs to `op`, using all steps in the interpolation as model input, for a single example
         output = op.outputs[0] #outputs from op ''
 
@@ -595,7 +637,7 @@ class IntegratedDeepLIFT(GradientBasedMethod): #shapes of self.Y and ys do not m
 # potential problem: self.gradients is cached and will not reload; so old values of deeplift_ref are cached there??? ie gradient constant values perfectly preserved
 class IntegratedDeepLIFT_true(GradientBasedMethod):
     _deeplift_ref = {}
-
+    _deeplift_ref_out = {}
     def __init__(self, T, X, session, keras_learning_phase, steps=100, baseline=None):
         #baseline, init refs, explain symbolic should all be done
         self.baseline = baseline
@@ -637,7 +679,7 @@ class IntegratedDeepLIFT_true(GradientBasedMethod):
         self.explain_symbolic()
 
         self.session.run(tf.initialize_variables(self._deeplift_ref.values()))
-
+        self.session.run(tf.initialize_variables(self._deeplift_ref_out.values()))
         gradient = None
         for alpha in list(np.linspace(1. / self.steps, 1.0, self.steps)):
             xs_mod = [b + (x - b) * alpha for x, b in zip(xs, self.baseline)] if self.has_multiple_inputs \
@@ -660,6 +702,50 @@ class IntegratedDeepLIFT_true(GradientBasedMethod):
 
     @classmethod
     def nonlinearity_grad_override(cls, op, grad):
+        # print(op.type)
+        if op.type == 'MaxPool':
+            print('hello')
+            xout = op.outputs[0]
+            input = op.inputs[0]
+            ref_input = cls._deeplift_ref[op.name]
+            rout = cls._deeplift_ref_out[op.name]#
+            delta_in = input - ref_input
+
+            # dup0 = [2] + [1 for i in delta_in.shape[1:]]
+            cross_max = tf.maximum(xout, rout)
+            # diffs = tf.concat([cross_max - rout, xout - cross_max], 0)
+            # xmax_pos,rmax_pos = tf.split(original_grad(op, grad * diffs), 2) #
+            diff1 = cross_max - rout
+            diff2 = xout - cross_max
+            xmax_pos = original_grad(op, grad*diff1)#*diff1#*diffs) #* diffs
+            rmax_pos = original_grad(op, grad*diff2)#*diff2#*diffs) #* diffs
+            testing1 = False
+            if testing1:
+
+                print('printed')
+                p1 = tf.print(('xout', xout))
+                p2 = tf.print(('input',input))
+                p3 = tf.print(('ref_input',ref_input))
+                p4 = tf.print(('rout',rout))
+                p6 = tf.print(('delta_in',delta_in))
+                # print("printing python id of ref_input")
+                # print(id(ref_input))
+                # to_print = tf.print((('output', xout), ('input',input),('ref_input',ref_input),  ('ref_output',rout),('cross_max', cross_max), ('diff1', diff1), ('delta_in',delta_in), ('xmax_pos', xmax_pos), ('rmax_pos', rmax_pos)))
+                to_print = tf.print((('grad.shape', grad.shape), ('xmax_pos', xmax_pos), ('rmax_pos', rmax_pos), ('diff1.shape', diff1.shape),('xmax_pos.shape', xmax_pos.shape) ))
+
+                with tf.control_dependencies([to_print]):
+                    result = tf.where(
+                        tf.abs(delta_in) < 1e-5,
+                        tf.zeros_like(delta_in),
+                        (xmax_pos + rmax_pos) / delta_in
+                    )
+                    return result
+            # return
+            return tf.where(
+                tf.abs(delta_in) < 1e-5,
+                tf.zeros_like(delta_in),
+                (xmax_pos + rmax_pos) / delta_in
+            )
         output = op.outputs[0]
         input = op.inputs[0]
         ref_input = cls._deeplift_ref[op.name]
@@ -692,6 +778,7 @@ class IntegratedDeepLIFT_true(GradientBasedMethod):
         # print ('DeepLIFT: computing references...')
         sys.stdout.flush()
         self._deeplift_ref.clear()
+        self._deeplift_ref_out.clear()
         ops = []
         g = tf.get_default_graph()
         for op in g.get_operations():
@@ -699,11 +786,16 @@ class IntegratedDeepLIFT_true(GradientBasedMethod):
                 if op.type in SUPPORTED_ACTIVATIONS:
                     ops.append(op)
         YR = self._session_run([o.inputs[0] for o in ops], self.expanded_baseline)
+        activs = self._session_run([o.outputs[0] for o in ops], self.expanded_baseline)
         for (r, op) in zip(YR, ops):
             # print(op.name)
             # print("value of reference to set:", r)
             self._deeplift_ref[op.name] = tf.Variable(r) # create Variable
             #self._deeplift_ref[op.name].load(r, self.session)
+        for (r, op) in zip(activs, ops):
+            # print(op.name)
+            # print("value of reference to set:", r)
+            self._deeplift_ref_out[op.name] = tf.Variable(r) # create Variable
         # self.session.run(tf.global_variables_initializer())
         # print('DeepLIFT: references ready')
         # print(self._deeplift_ref)
@@ -720,6 +812,7 @@ class IntegratedDeepLIFT_true(GradientBasedMethod):
                 if op.type in SUPPORTED_ACTIVATIONS:
                     ops.append(op)
         YR = self._session_run([o.inputs[0] for o in ops], xs)
+        activs = self._session_run([o.outputs[0] for o in ops], xs)
         # print(YR)
         # print('OPS')
         for (r, op) in zip(YR, ops):
@@ -738,6 +831,23 @@ class IntegratedDeepLIFT_true(GradientBasedMethod):
             else:
                 print('NOT PRESENT')
                 self._deeplift_ref[op.name] = tf.Variable(r)
+
+        for (r, op) in zip(activs, ops):
+            # print(op.name)
+            # print("value of reference to set:", r)
+            if op.name in self._deeplift_ref_out: # check if op already present
+                #print('ALREADY CONTAINED')
+                # print("setting", op.name)
+                # print( self.session.run(self._deeplift_ref[op.name].assign(r)) )#, self.session)
+                # print("checking if value updated")
+                # print( self.session.run(self._deeplift_ref[op.name] ) )
+                # print("printing python id of _deeplift_ref op")
+                # print(id(self._deeplift_ref[op.name]))
+                self._deeplift_ref_out[op.name].load(r, self.session)
+
+            else:
+                print('NOT PRESENT')
+                self._deeplift_ref_out[op.name] = tf.Variable(r)
         # print('DeepLIFT: references ready')
         # print(self._deeplift_ref)
         sys.stdout.flush()
@@ -1077,7 +1187,7 @@ class DeepExplain(object):
 
         logging.info('DeepExplain: running "%s" explanation method (%d)' % (self.method, method_flag))
         self._check_ops()
-        _GRAD_OVERRIDE_CHECKFLAG = 1 # modified?
+        _GRAD_OVERRIDE_CHECKFLAG = 0 # modified?
 
         _ENABLED_METHOD_CLASS = method_class
         method = _ENABLED_METHOD_CLASS(T, X,
@@ -1098,7 +1208,6 @@ class DeepExplain(object):
     def explain(self, method, T, X, xs, ys=None, batch_size=None, **kwargs):
         explainer = self.get_explainer(method, T, X, **kwargs)
         result = explainer.run(xs, ys, batch_size)
-        print(np.array(result).shape)
         return result
 
     @staticmethod
