@@ -366,7 +366,7 @@ class DeepLIFTRescale(GradientBasedMethod):
         self.baseline = baseline
         super(DeepLIFTRescale, self).__init__(T, X, session, keras_learning_phase)
 
-        # blah = tf.gradients(self.T, self.X)
+        # _ = tf.gradients(self.T, self.X)
         # print('still in init')
 
     def get_symbolic_attribution(self):
@@ -393,7 +393,7 @@ class DeepLIFTRescale(GradientBasedMethod):
     @classmethod
     def nonlinearity_grad_override(cls, op, grad):
         if op.type == 'MaxPool':
-            print('in maxpool')
+            # print('in maxpool')
             xout = op.outputs[0]
             input = op.inputs[0]
             ref_input = cls._deeplift_ref[op.name]
@@ -404,12 +404,83 @@ class DeepLIFTRescale(GradientBasedMethod):
             diff1 = cross_max - rout
             diff2 = xout - cross_max
             xmax_pos = original_grad(op, grad*diff1)
-            rmax_pos = original_grad(op, grad*diff2)
+            # rmax_pos = original_grad(op, grad*diff2)
             # replace: "maxpoolgrad"(op, )
             # orig_input=ref_input, orig_output=ref_output, grad=grad *diff2
             # extract k_size, stride, padding from op
 
-            testing1 = True
+            # getting arguments from op
+            node_def = op.node_def
+            padding = node_def.attr["padding"].s.decode("ASCII")
+            strides = node_def.attr["strides"].list.i
+            strides = list(strides)
+            ksize = node_def.attr["ksize"].list.i
+            ksize = list(ksize)
+
+            # prepare tiling
+            batch_size = tf.shape(grad)[0:1]
+            batch_size = tf.expand_dims(batch_size, 0)
+            # print("batch_size")
+            # print(batch_size)
+
+            ones = tf.constant([1]*(len(ref_input.shape)-1),dtype=tf.dtypes.int32)
+            ones = tf.expand_dims(ones, 0)
+            # print("ones")
+            # print(ones)
+
+            multiples = tf.concat([batch_size, ones], axis=1)
+            multiples = multiples[0]
+            # print("multiples")
+            # print(multiples)
+
+            correct_input_shape = tf.shape(input)
+            tf_ref_input = tf.constant(ref_input)
+            tiled_ref_input = tf.tile(tf_ref_input, multiples)
+            tiled_ref_input = tf.reshape(tiled_ref_input, correct_input_shape)
+
+            correct_output_shape = tf.shape(xout)
+
+            ones = tf.constant([1]*(len(rout.shape)-1),dtype=tf.dtypes.int32)
+            ones = tf.expand_dims(ones, 0)
+            # print("ones")
+            # print(ones)
+
+            multiples = tf.concat([batch_size, ones], axis=1)
+            multiples = multiples[0]
+            # print("multiples")
+            # print(multiples)
+
+            tiled_ref_output = tf.tile(rout, multiples)
+            tiled_ref_output = tf.reshape(tiled_ref_output, correct_output_shape)
+            # print("tiled_ref_input")
+            # print(tiled_ref_input)
+            rmax_pos = nn_grad.gen_nn_ops.max_pool_grad(
+                orig_input= tiled_ref_input,#tf.ones((tf.shape(grad)[0], 1)) * ref_input,
+                orig_output= tiled_ref_output, # tf.ones((tf.shape(grad)[0], 1)) * rout,
+                grad=grad*diff2,
+                #ksize=[1]+list(self.pool_size)+[1],
+                ksize=ksize,#[1,2,2,1],#[1]+op.ksize+[1],
+                strides=strides,#[1,2,2,1],#[1]+list(op.strides)+[1],
+                padding=padding)#"VALID")#op.padding)
+
+            t = False
+            if t:
+                print("grad")
+                print(grad)
+                print("input")
+                print(input)
+                print("diff1")
+                print(diff1)
+                print("diff2")
+                print(diff2)
+                print("rmax_pos")
+                print(rmax_pos)
+                print("xmax_pos")
+                print(xmax_pos)
+                print("ref_input")
+                print(ref_input.shape)
+
+            testing1 = False
             if testing1:
 
                 print('printed')
@@ -421,7 +492,7 @@ class DeepLIFTRescale(GradientBasedMethod):
                 # print("printing python id of ref_input")
                 # print(id(ref_input))
                 # to_print = tf.print((('output', xout), ('input',input),('ref_input',ref_input),  ('ref_output',rout),('cross_max', cross_max), ('diff1', diff1), ('delta_in',delta_in), ('xmax_pos', xmax_pos), ('rmax_pos', rmax_pos)))
-                to_print = tf.print((('grad', grad), ('xmax_pos', xmax_pos), ('rmax_pos', rmax_pos), ('diff1', diff1),('diff2', diff2) ))
+                to_print = tf.print(( (tf.shape(grad)[0]), ('grad', grad), ('ref_input', ref_input), ('rout', rout), ('xmax_pos', xmax_pos), ('rmax_pos', rmax_pos), ('diff1', diff1),('diff2', diff2) ))
 
                 with tf.control_dependencies([to_print]):
                     result = tf.where(
