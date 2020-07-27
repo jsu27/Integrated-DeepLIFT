@@ -405,20 +405,23 @@ class DeepLIFTRescale(GradientBasedMethod):
             diff2 = xout - cross_max
             xmax_pos = original_grad(op, grad*diff1)
             rmax_pos = original_grad(op, grad*diff2)
+            # replace: "maxpoolgrad"(op, )
+            # orig_input=ref_input, orig_output=ref_output, grad=grad *diff2
+            # extract k_size, stride, padding from op
 
-            testing1 = False
+            testing1 = True
             if testing1:
 
                 print('printed')
-                p1 = tf.print(('xout', xout))
-                p2 = tf.print(('input',input))
-                p3 = tf.print(('ref_input',ref_input))
-                p4 = tf.print(('rout',rout))
-                p6 = tf.print(('delta_in',delta_in))
+                # p1 = tf.print(('xout', xout))
+                # p2 = tf.print(('input',input))
+                # p3 = tf.print(('ref_input',ref_input))
+                # p4 = tf.print(('rout',rout))
+                # p6 = tf.print(('delta_in',delta_in))
                 # print("printing python id of ref_input")
                 # print(id(ref_input))
                 # to_print = tf.print((('output', xout), ('input',input),('ref_input',ref_input),  ('ref_output',rout),('cross_max', cross_max), ('diff1', diff1), ('delta_in',delta_in), ('xmax_pos', xmax_pos), ('rmax_pos', rmax_pos)))
-                to_print = tf.print((('grad.shape', grad.shape), ('xmax_pos', xmax_pos), ('rmax_pos', rmax_pos), ('diff1.shape', diff1.shape),('xmax_pos.shape', xmax_pos.shape) ))
+                to_print = tf.print((('grad', grad), ('xmax_pos', xmax_pos), ('rmax_pos', rmax_pos), ('diff1', diff1),('diff2', diff2) ))
 
                 with tf.control_dependencies([to_print]):
                     result = tf.where(
@@ -428,11 +431,20 @@ class DeepLIFTRescale(GradientBasedMethod):
                     )
                     return result
             # return
+            # return tf.where(
+            #     tf.abs(delta_in) < 1e-5, # 1e-5
+            #     tf.zeros_like(delta_in),
+            #     (xmax_pos + rmax_pos) / delta_in
+            # )
+            # instant_grad = activation(op.type)(0.5 * (ref_input + input))
             return tf.where(
-                tf.abs(delta_in) < 1e-5, # 1e-5
-                tf.zeros_like(delta_in),
+                tf.abs(delta_in) < 1e-7, # 1e-5
+                original_grad(op, grad),
                 (xmax_pos + rmax_pos) / delta_in
             )
+
+
+
 
 
         output = op.outputs[0]
