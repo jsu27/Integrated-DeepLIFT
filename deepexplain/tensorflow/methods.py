@@ -12,6 +12,11 @@ from tensorflow.python.ops import nn_grad, math_grad
 from collections import OrderedDict
 from .utils import make_batches, slice_arrays, to_list, unpack_singleton, placeholder_from_data
 
+from time import time
+
+
+tf.compat.v1.disable_v2_behavior()
+
 SUPPORTED_ACTIVATIONS = [
     'Relu', 'Elu', 'Sigmoid', 'Tanh', 'Softplus', 'MaxPool'
 ]
@@ -290,15 +295,20 @@ class IntegratedGradients(GradientBasedMethod):
 
     def run(self, xs, ys=None, batch_size=None):
         self._check_input_compatibility(xs, ys, batch_size)
+        session_run_time = 0
 
         gradient = None
         for alpha in list(np.linspace(1. / self.steps, 1.0, self.steps)):
             xs_mod = [b + (x - b) * alpha for x, b in zip(xs, self.baseline)] if self.has_multiple_inputs \
                 else self.baseline + (xs - self.baseline) * alpha
+            start = time()
             _attr = self._session_run(self.explain_symbolic(), xs_mod, ys, batch_size)
+            end = time()
+            session_run_time += end - start
+
             if gradient is None: gradient = _attr
             else: gradient = [g + a for g, a in zip(gradient, _attr)]
-
+        print('Int Grads session run time', session_run_time)
         results = [g * (x - b) / self.steps for g, x, b in zip(
             gradient,
             xs if self.has_multiple_inputs else [xs],
@@ -629,7 +639,6 @@ class IntegratedDeepLIFT_v2(GradientBasedMethod):
         sys.stdout.flush()
 
 
-
 class IntegratedDeepLIFT(GradientBasedMethod): #shapes of self.Y and ys do not match
 
     _deeplift_ref = {}
@@ -642,20 +651,47 @@ class IntegratedDeepLIFT(GradientBasedMethod): #shapes of self.Y and ys do not m
         self._check_input_compatibility(xs, ys, batch_size)
 
         results = []
+        interpolation_time = 0
+        session_run_time = 0
+        gradient_time = 0
 
         for x in xs: #for each example:
             self.baseline = np.zeros(xs.shape[1:])
-            interpolation = [self.baseline + i/self.steps*(x - self.baseline) for i in range(self.steps+1)] #evenly-spaced steps ranging from baseline to example's input values
+
+            start = time()
+            # interpolation = [self.baseline + i/self.steps*(x - self.baseline) for i in range(self.steps+1)] #evenly-spaced steps ranging from baseline to example's input values
+
+            alpha_values = np.linspace(0, 1.0, self.steps+1)
+            x_minus_baseline = x - self.baseline
+            correct_shape = (self.steps+1,) + (1,) * (len(xs.shape) - 1)
+            # interpolation = self.baseline[None, :] + alpha_values[:, None] * x_minus_baseline[None, :]
+            interpolation = self.baseline[None, :] + alpha_values.reshape(correct_shape) * x_minus_baseline[None, :]
+
+
+            end = time()
+            interpolation_time += end - start
+
+            start = time()
             attribs = self._session_run(self.explain_symbolic(), interpolation, ys, batch_size)[0] #run attributions with all steps of interpolation at once
+            end = time()
+            session_run_time += end - start
+
+            start = time()
             gradient = np.sum(np.array(attribs[1:]), axis=0) #ignore 1st step, which uses baseline as input
+            end = time()
+            gradient_time += end - start
             results.append(gradient * (x - self.baseline)/self.steps) #result is sum of all (gradient * change in step)
 
+        print('interpolation', interpolation_time)
+        print('session run', session_run_time)
+        print('gradient', gradient_time)
+        print()
         return results
 
 
     @classmethod
     def nonlinearity_grad_override(cls, op, grad): #custom gradient for DeepLIFT multiplier
-        if op.type == 'blahblahMaxPool':
+        if op.type == 'MaxPool':
             output = op.outputs[0]
             input = op.inputs[0]
             ref_input = tf.concat([input[0:1], input[0:-1]], axis=0) #input[0:1] is 1st component; input[0:-1] ranges from 1st to second-to-last component
@@ -671,7 +707,83 @@ class IntegratedDeepLIFT(GradientBasedMethod): #shapes of self.Y and ys do not m
             diff1 = cross_max - ref_output
             diff2 = output - cross_max
             xmax_pos = original_grad(op, grad*diff1)#*diff1#*diffs) #* diffs
-            rmax_pos = original_grad(op, grad*diff2)#*diff2#*diffs) #* diffs
+
+
+
+
+
+
+            # getting arguments from op
+            node_def = op.node_def
+            padding = node_def.attr["padding"].s.decode("ASCII")
+            strides = node_def.attr["strides"].list.i
+            strides = list(strides)
+            ksize = node_def.attr["ksize"].list.i
+            ksize = list(ksize)
+
+            # # prepare tiling
+            # batch_size = tf.shape(grad)[0:1]
+            # batch_size = tf.expand_dims(batch_size, 0)
+            # # print("batch_size")
+            # # print(batch_size)
+            #
+            # ones = tf.constant([1]*(len(ref_input.shape)-1),dtype=tf.dtypes.int32)
+            # ones = tf.expand_dims(ones, 0)
+            # # print("ones")
+            # # print(ones)
+            #
+            # multiples = tf.concat([batch_size, ones], axis=1)
+            # multiples = multiples[0]
+            # # print("multiples")
+            # # print(multiples)
+            #
+            # correct_input_shape = tf.shape(input)
+            # tf_ref_input = tf.constant(ref_input)
+            # tiled_ref_input = tf.tile(tf_ref_input, multiples)
+            # tiled_ref_input = tf.reshape(tiled_ref_input, correct_input_shape)
+            #
+            # correct_output_shape = tf.shape(xout)
+            #
+            # ones = tf.constant([1]*(len(rout.shape)-1),dtype=tf.dtypes.int32)
+            # ones = tf.expand_dims(ones, 0)
+            # # print("ones")
+            # # print(ones)
+            #
+            # multiples = tf.concat([batch_size, ones], axis=1)
+            # multiples = multiples[0]
+            # # print("multiples")
+            # # print(multiples)
+            #
+            # tiled_ref_output = tf.tile(rout, multiples)
+            # tiled_ref_output = tf.reshape(tiled_ref_output, correct_output_shape)
+            # print("tiled_ref_input")
+            # print(tiled_ref_input)
+            rmax_pos = nn_grad.gen_nn_ops.max_pool_grad(
+                orig_input= ref_input,#tf.ones((tf.shape(grad)[0], 1)) * ref_input,
+                orig_output= ref_output, # tf.ones((tf.shape(grad)[0], 1)) * rout,
+                grad=grad*diff2,
+                #ksize=[1]+list(self.pool_size)+[1],
+                ksize=ksize,#[1,2,2,1],#[1]+op.ksize+[1],
+                strides=strides,#[1,2,2,1],#[1]+list(op.strides)+[1],
+                padding=padding)#"VALID")#op.padding)
+
+            t = False
+            print('in maxpool')
+            if t:
+                print("grad")
+                print(grad)
+                print("input")
+                print(input)
+                print("diff1")
+                print(diff1)
+                print("diff2")
+                print(diff2)
+                print("rmax_pos")
+                print(rmax_pos)
+                print("xmax_pos")
+                print(xmax_pos)
+                print("ref_input")
+                print(ref_input.shape)
             testing1 = False
             if testing1:
 
@@ -695,8 +807,9 @@ class IntegratedDeepLIFT(GradientBasedMethod): #shapes of self.Y and ys do not m
                     return result
                 # return
             return tf.where(
-                tf.abs(delta_in) < 1e-2, # before 1e-5
+                tf.abs(delta_in) < 1e-7, # before 1e-5
                 tf.zeros_like(delta_in),
+                #original_grad(op, grad),
                 (xmax_pos + rmax_pos) / delta_in
             )
 
@@ -1283,7 +1396,7 @@ class DeepExplain(object):
                           'gradient override but the original gradient was used instead. You might have forgot to '
                           '(re)create your graph within the DeepExlain context. Results are not reliable!')
         # commented out, otherwise gradient override will be called once Method is constructed, and then turn off (?)
-        _ENABLED_METHOD_CLASS = None
+        # _ENABLED_METHOD_CLASS = None
         _GRAD_OVERRIDE_CHECKFLAG = 0
         self.keras_phase_placeholder = None
         return method
