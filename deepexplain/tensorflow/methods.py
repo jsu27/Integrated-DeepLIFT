@@ -639,6 +639,204 @@ class IntegratedDeepLIFT_v2(GradientBasedMethod):
         sys.stdout.flush()
 
 
+class IntegratedDeepLIFT_batch(GradientBasedMethod): #shapes of self.Y and ys do not match
+
+    _deeplift_ref = {}
+    def __init__(self, T, X, session, keras_learning_phase, steps=100, baseline=None):
+        self.baseline = baseline
+        self.steps = steps
+        super(IntegratedDeepLIFT_batch, self).__init__(T, X, session, keras_learning_phase)
+
+    def run(self, xs, ys=None, batch_size=None):
+        self._check_input_compatibility(xs, ys, batch_size)
+
+        results = []
+        interpolation_time = 0
+        session_run_time = 0
+        gradient_time = 0
+
+        n = xs.shape[0]
+        print(n)
+        if batch_size == None:
+            batch_size = n
+        for i in range(batch_size):
+            x = xs[i*n//batch_size : (i+1)*n//batch_size]
+
+        # for x in xs: #for each example:
+            self.baseline = np.zeros(xs.shape[1:])
+
+            start = time()
+            # interpolation = [self.baseline + i/self.steps*(x - self.baseline) for i in range(self.steps+1)] #evenly-spaced steps ranging from baseline to example's input values
+
+            alpha_values = np.linspace(0, 1.0, self.steps+1)
+            x_minus_baseline = x - self.baseline
+            correct_shape = (self.steps+1,) + (1,) * (len(xs.shape) - 1)
+            # interpolation = self.baseline[None, :] + alpha_values[:, None] * x_minus_baseline[None, :]
+            interpolation = self.baseline[None, :] + alpha_values.reshape(correct_shape) * x_minus_baseline[None, :]
+
+
+            end = time()
+            interpolation_time += end - start
+
+            start = time()
+            attribs = self._session_run(self.explain_symbolic(), interpolation, ys, batch_size)[0] #run attributions with all steps of interpolation at once
+            end = time()
+            session_run_time += end - start
+
+            start = time()
+            gradient = np.sum(np.array(attribs[1:]), axis=0) #ignore 1st step, which uses baseline as input
+            end = time()
+            gradient_time += end - start
+            results.append(gradient * (x - self.baseline)/self.steps) #result is sum of all (gradient * change in step)
+
+        # print('interpolation', interpolation_time)
+        # print('session run', session_run_time)
+        # print('gradient', gradient_time)
+        # print()
+        return results
+
+
+    @classmethod
+    def nonlinearity_grad_override(cls, op, grad): #custom gradient for DeepLIFT multiplier
+        if op.type == 'MaxPool':
+            output = op.outputs[0]
+            input = op.inputs[0]
+            ref_input = tf.concat([input[0:1], input[0:-1]], axis=0) #input[0:1] is 1st component; input[0:-1] ranges from 1st to second-to-last component
+            ref_output = tf.concat([output[0:1], output[0:-1]], axis=0) #same logic
+            # ref_input = cls._deeplift_ref[op.name]
+            # rout = cls._deeplift_ref_out[op.name]#
+            delta_in = input - ref_input
+
+            # dup0 = [2] + [1 for i in delta_in.shape[1:]]
+            cross_max = tf.maximum(output, ref_output)
+            # diffs = tf.concat([cross_max - rout, xout - cross_max], 0)
+            # xmax_pos,rmax_pos = tf.split(original_grad(op, grad * diffs), 2) #
+            diff1 = cross_max - ref_output
+            diff2 = output - cross_max
+            xmax_pos = original_grad(op, grad*diff1)#*diff1#*diffs) #* diffs
+
+
+
+
+
+
+            # getting arguments from op
+            node_def = op.node_def
+            padding = node_def.attr["padding"].s.decode("ASCII")
+            strides = node_def.attr["strides"].list.i
+            strides = list(strides)
+            ksize = node_def.attr["ksize"].list.i
+            ksize = list(ksize)
+
+            # # prepare tiling
+            # batch_size = tf.shape(grad)[0:1]
+            # batch_size = tf.expand_dims(batch_size, 0)
+            # # print("batch_size")
+            # # print(batch_size)
+            #
+            # ones = tf.constant([1]*(len(ref_input.shape)-1),dtype=tf.dtypes.int32)
+            # ones = tf.expand_dims(ones, 0)
+            # # print("ones")
+            # # print(ones)
+            #
+            # multiples = tf.concat([batch_size, ones], axis=1)
+            # multiples = multiples[0]
+            # # print("multiples")
+            # # print(multiples)
+            #
+            # correct_input_shape = tf.shape(input)
+            # tf_ref_input = tf.constant(ref_input)
+            # tiled_ref_input = tf.tile(tf_ref_input, multiples)
+            # tiled_ref_input = tf.reshape(tiled_ref_input, correct_input_shape)
+            #
+            # correct_output_shape = tf.shape(xout)
+            #
+            # ones = tf.constant([1]*(len(rout.shape)-1),dtype=tf.dtypes.int32)
+            # ones = tf.expand_dims(ones, 0)
+            # # print("ones")
+            # # print(ones)
+            #
+            # multiples = tf.concat([batch_size, ones], axis=1)
+            # multiples = multiples[0]
+            # # print("multiples")
+            # # print(multiples)
+            #
+            # tiled_ref_output = tf.tile(rout, multiples)
+            # tiled_ref_output = tf.reshape(tiled_ref_output, correct_output_shape)
+            # print("tiled_ref_input")
+            # print(tiled_ref_input)
+            rmax_pos = nn_grad.gen_nn_ops.max_pool_grad(
+                orig_input= ref_input,#tf.ones((tf.shape(grad)[0], 1)) * ref_input,
+                orig_output= ref_output, # tf.ones((tf.shape(grad)[0], 1)) * rout,
+                grad=grad*diff2,
+                #ksize=[1]+list(self.pool_size)+[1],
+                ksize=ksize,#[1,2,2,1],#[1]+op.ksize+[1],
+                strides=strides,#[1,2,2,1],#[1]+list(op.strides)+[1],
+                padding=padding)#"VALID")#op.padding)
+
+            t = False
+            print('in maxpool')
+            if t:
+                print("grad")
+                print(grad)
+                print("input")
+                print(input)
+                print("diff1")
+                print(diff1)
+                print("diff2")
+                print(diff2)
+                print("rmax_pos")
+                print(rmax_pos)
+                print("xmax_pos")
+                print(xmax_pos)
+                print("ref_input")
+                print(ref_input.shape)
+            testing1 = False
+            if testing1:
+
+                print('printed')
+                p1 = tf.print(('xout', output))
+                p2 = tf.print(('input',input))
+                p3 = tf.print(('ref_input',ref_input))
+                p4 = tf.print(('rout',ref_output))
+                p6 = tf.print(('delta_in',delta_in))
+                # print("printing python id of ref_input")
+                # print(id(ref_input))
+                # to_print = tf.print((('output', xout), ('input',input),('ref_input',ref_input),  ('ref_output',rout),('cross_max', cross_max), ('diff1', diff1), ('delta_in',delta_in), ('xmax_pos', xmax_pos), ('rmax_pos', rmax_pos)))
+                to_print = tf.print((('grad.shape', grad.shape), ('xmax_pos', xmax_pos), ('rmax_pos', rmax_pos), ('diff1.shape', diff1.shape),('xmax_pos.shape', xmax_pos.shape) ))
+
+                with tf.control_dependencies([to_print]):
+                    result = tf.where(
+                        tf.abs(delta_in) < 1e-5,
+                        tf.zeros_like(delta_in),
+                        (xmax_pos + rmax_pos) / delta_in
+                    )
+                    return result
+                # return
+            return tf.where(
+                tf.abs(delta_in) < 1e-7, # before 1e-5
+                tf.zeros_like(delta_in),
+                #original_grad(op, grad),
+                (xmax_pos + rmax_pos) / delta_in
+            )
+
+        input = op.inputs[0] #inputs to `op`, using all steps in the interpolation as model input, for a single example
+        output = op.outputs[0] #outputs from op ''
+
+        #`ref_input` (below) is the list of reference values, for the corresponding input values in `input` (with steps in interpolation as model input).
+        #Because for each step in the interpolation, its reference value is equal to the previous step's value,
+        #the reference for a step in `input` is equal to the previous step's value.
+        #So we define ref_input to be `input`, shifted one index to the right, so that each step in `input` can be matched with its "previous step" in `ref_input`.
+        #To keep dimensions correct, the 1st step in `ref_input` (which is now empty) will be set to the 1st step in `input` (e.g. if `input` is [1,2,3,4], `ref_input` is [1,1,2,3]).
+        #We will be ignoring the 1st index of the attributions anyway, because it corresponds to the baseline as input.
+        ref_input = tf.concat([input[0:1], input[0:-1]], axis=0) #input[0:1] is 1st component; input[0:-1] ranges from 1st to second-to-last component
+        ref_output = tf.concat([output[0:1], output[0:-1]], axis=0) #same logic for reference output
+        delta_out = output - ref_output
+        delta_in = input - ref_input
+        instant_grad = activation(op.type)(0.5 * (ref_input + input))
+        return tf.where(tf.abs(delta_in) > 1e-5, grad * delta_out / delta_in,
+                               original_grad(instant_grad.op, grad))
+
 class IntegratedDeepLIFT(GradientBasedMethod): #shapes of self.Y and ys do not match
 
     _deeplift_ref = {}
@@ -682,10 +880,10 @@ class IntegratedDeepLIFT(GradientBasedMethod): #shapes of self.Y and ys do not m
             gradient_time += end - start
             results.append(gradient * (x - self.baseline)/self.steps) #result is sum of all (gradient * change in step)
 
-        print('interpolation', interpolation_time)
-        print('session run', session_run_time)
-        print('gradient', gradient_time)
-        print()
+        # print('interpolation', interpolation_time)
+        # print('session run', session_run_time)
+        # print('gradient', gradient_time)
+        # print()
         return results
 
 
@@ -1319,7 +1517,8 @@ attribution_methods = OrderedDict({
     'integdeeplift': (IntegratedDeepLIFT_v2, 8),
     'idl': (IntegratedDeepLIFT, 9),
     'idl_true': (IntegratedDeepLIFT_true, 10),
-    'intgrad_new': (IntegratedGradients_new, 11)
+    'intgrad_new': (IntegratedGradients_new, 11),
+    'idl_batch': (IntegratedDeepLIFT_batch, 12)
 })
 
 
