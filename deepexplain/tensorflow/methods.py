@@ -12,8 +12,13 @@ from tensorflow.python.ops import nn_grad, math_grad
 from collections import OrderedDict
 from .utils import make_batches, slice_arrays, to_list, unpack_singleton, placeholder_from_data
 
+from time import time
+
+
+tf.compat.v1.disable_v2_behavior()
+
 SUPPORTED_ACTIVATIONS = [
-    'Relu', 'Elu', 'Sigmoid', 'Tanh', 'Softplus'
+    'Relu', 'Elu', 'Sigmoid', 'Tanh', 'Softplus', 'MaxPool'
 ]
 
 UNSUPPORTED_ACTIVATIONS = [
@@ -211,7 +216,9 @@ class GradientBasedMethod(AttributionMethod):
 
     def run(self, xs, ys=None, batch_size=None):
         self._check_input_compatibility(xs, ys, batch_size)
+        print(xs.shape)
         results = self._session_run(self.explain_symbolic(), xs, ys, batch_size)
+        print(np.array(results).shape)
         return results[0] if not self.has_multiple_inputs else results
 
     @classmethod
@@ -288,15 +295,20 @@ class IntegratedGradients(GradientBasedMethod):
 
     def run(self, xs, ys=None, batch_size=None):
         self._check_input_compatibility(xs, ys, batch_size)
+        session_run_time = 0
 
         gradient = None
         for alpha in list(np.linspace(1. / self.steps, 1.0, self.steps)):
             xs_mod = [b + (x - b) * alpha for x, b in zip(xs, self.baseline)] if self.has_multiple_inputs \
                 else self.baseline + (xs - self.baseline) * alpha
+            start = time()
             _attr = self._session_run(self.explain_symbolic(), xs_mod, ys, batch_size)
+            end = time()
+            session_run_time += end - start
+
             if gradient is None: gradient = _attr
             else: gradient = [g + a for g, a in zip(gradient, _attr)]
-
+        print('Int Grads session run time', session_run_time)
         results = [g * (x - b) / self.steps for g, x, b in zip(
             gradient,
             xs if self.has_multiple_inputs else [xs],
@@ -304,6 +316,23 @@ class IntegratedGradients(GradientBasedMethod):
 
         return results[0] if not self.has_multiple_inputs else results
 
+# "perpendicular" implementation of IG, iterating over each sample instead of each step
+class IntegratedGradients_new(GradientBasedMethod):
+    def __init__(self, T, X, session, keras_learning_phase, steps=100, baseline=None):
+        self.steps = steps
+        self.baseline = baseline
+        super(IntegratedGradients_new, self).__init__(T, X, session, keras_learning_phase)
+
+    def run(self, xs, ys=None, batch_size=None):
+        self._check_input_compatibility(xs, ys, batch_size)
+        results = []
+        for x in xs:
+            interpolation = [self.baseline[0] + i/self.steps*(x - self.baseline[0]) for i in range(self.steps+1)]
+            attribs = self._session_run(self.explain_symbolic(), interpolation, ys, batch_size)[0]
+            gradient = np.sum(np.array(attribs[1:]), axis=0) #ignore 1st step which is baseline
+            results.append(gradient * (x - self.baseline[0])/self.steps)
+
+        return results
 
 """
 Layer-wise Relevance Propagation with epsilon rule
@@ -342,19 +371,163 @@ https://arxiv.org/abs/1704.02685
 class DeepLIFTRescale(GradientBasedMethod):
 
     _deeplift_ref = {}
-
+    _deeplift_ref_out = {}
     def __init__(self, T, X, session, keras_learning_phase, baseline=None):
         self.baseline = baseline
         super(DeepLIFTRescale, self).__init__(T, X, session, keras_learning_phase)
 
+        # _ = tf.gradients(self.T, self.X)
+        # print('still in init')
+
     def get_symbolic_attribution(self):
+        print('get symbolic')
         return [g * (x - b) for g, x, b in zip(
             tf.gradients(self.T, self.X),
             self.X if self.has_multiple_inputs else [self.X],
             self.baseline if self.has_multiple_inputs else [self.baseline])]
+        # return 0
+    #
+    # # Testing gradient override in instance method
+    # def run(self, xs, ys=None, batch_size=None):
+    #     self._check_input_compatibility(xs, ys, batch_size)
+    #     grads = tf.gradients(self.T, self.X)
+    #     attribs = [g * (x - b) for g, x, b in zip(
+    #         grads,
+    #         self.X if self.has_multiple_inputs else [self.X],
+    #         self.baseline if self.has_multiple_inputs else [self.baseline])]
+    #     results = self._session_run(attribs, xs, ys, batch_size)
+    #     return results[0] if not self.has_multiple_inputs else results
+    #
+
 
     @classmethod
     def nonlinearity_grad_override(cls, op, grad):
+        if op.type == 'MaxPool':
+            # print('in maxpool')
+            xout = op.outputs[0]
+            input = op.inputs[0]
+            ref_input = cls._deeplift_ref[op.name]
+            rout = cls._deeplift_ref_out[op.name]#
+            delta_in = input - ref_input
+
+            cross_max = tf.maximum(xout, rout)
+            diff1 = cross_max - rout
+            diff2 = xout - cross_max
+            xmax_pos = original_grad(op, grad*diff1)
+            # rmax_pos = original_grad(op, grad*diff2)
+            # replace: "maxpoolgrad"(op, )
+            # orig_input=ref_input, orig_output=ref_output, grad=grad *diff2
+            # extract k_size, stride, padding from op
+
+            # getting arguments from op
+            node_def = op.node_def
+            padding = node_def.attr["padding"].s.decode("ASCII")
+            strides = node_def.attr["strides"].list.i
+            strides = list(strides)
+            ksize = node_def.attr["ksize"].list.i
+            ksize = list(ksize)
+
+            # prepare tiling
+            batch_size = tf.shape(grad)[0:1]
+            batch_size = tf.expand_dims(batch_size, 0)
+            # print("batch_size")
+            # print(batch_size)
+
+            ones = tf.constant([1]*(len(ref_input.shape)-1),dtype=tf.dtypes.int32)
+            ones = tf.expand_dims(ones, 0)
+            # print("ones")
+            # print(ones)
+
+            multiples = tf.concat([batch_size, ones], axis=1)
+            multiples = multiples[0]
+            # print("multiples")
+            # print(multiples)
+
+            correct_input_shape = tf.shape(input)
+            tf_ref_input = tf.constant(ref_input)
+            tiled_ref_input = tf.tile(tf_ref_input, multiples)
+            tiled_ref_input = tf.reshape(tiled_ref_input, correct_input_shape)
+
+            correct_output_shape = tf.shape(xout)
+
+            ones = tf.constant([1]*(len(rout.shape)-1),dtype=tf.dtypes.int32)
+            ones = tf.expand_dims(ones, 0)
+            # print("ones")
+            # print(ones)
+
+            multiples = tf.concat([batch_size, ones], axis=1)
+            multiples = multiples[0]
+            # print("multiples")
+            # print(multiples)
+
+            tiled_ref_output = tf.tile(rout, multiples)
+            tiled_ref_output = tf.reshape(tiled_ref_output, correct_output_shape)
+            # print("tiled_ref_input")
+            # print(tiled_ref_input)
+            rmax_pos = nn_grad.gen_nn_ops.max_pool_grad(
+                orig_input= tiled_ref_input,#tf.ones((tf.shape(grad)[0], 1)) * ref_input,
+                orig_output= tiled_ref_output, # tf.ones((tf.shape(grad)[0], 1)) * rout,
+                grad=grad*diff2,
+                #ksize=[1]+list(self.pool_size)+[1],
+                ksize=ksize,#[1,2,2,1],#[1]+op.ksize+[1],
+                strides=strides,#[1,2,2,1],#[1]+list(op.strides)+[1],
+                padding=padding)#"VALID")#op.padding)
+
+            t = False
+            if t:
+                print("grad")
+                print(grad)
+                print("input")
+                print(input)
+                print("diff1")
+                print(diff1)
+                print("diff2")
+                print(diff2)
+                print("rmax_pos")
+                print(rmax_pos)
+                print("xmax_pos")
+                print(xmax_pos)
+                print("ref_input")
+                print(ref_input.shape)
+
+            testing1 = False
+            if testing1:
+
+                print('printed')
+                # p1 = tf.print(('xout', xout))
+                # p2 = tf.print(('input',input))
+                # p3 = tf.print(('ref_input',ref_input))
+                # p4 = tf.print(('rout',rout))
+                # p6 = tf.print(('delta_in',delta_in))
+                # print("printing python id of ref_input")
+                # print(id(ref_input))
+                # to_print = tf.print((('output', xout), ('input',input),('ref_input',ref_input),  ('ref_output',rout),('cross_max', cross_max), ('diff1', diff1), ('delta_in',delta_in), ('xmax_pos', xmax_pos), ('rmax_pos', rmax_pos)))
+                to_print = tf.print(( (tf.shape(grad)[0]), ('grad', grad), ('ref_input', ref_input), ('rout', rout), ('xmax_pos', xmax_pos), ('rmax_pos', rmax_pos), ('diff1', diff1),('diff2', diff2) ))
+
+                with tf.control_dependencies([to_print]):
+                    result = tf.where(
+                        tf.abs(delta_in) < 1e-5,
+                        tf.zeros_like(delta_in),
+                        (xmax_pos + rmax_pos) / delta_in
+                    )
+                    return result
+            # return
+            # return tf.where(
+            #     tf.abs(delta_in) < 1e-5, # 1e-5
+            #     tf.zeros_like(delta_in),
+            #     (xmax_pos + rmax_pos) / delta_in
+            # )
+            # instant_grad = activation(op.type)(0.5 * (ref_input + input))
+            return tf.where(
+                tf.abs(delta_in) < 1e-7, # 1e-5
+                original_grad(op, grad),
+                (xmax_pos + rmax_pos) / delta_in
+            )
+
+
+
+
+
         output = op.outputs[0]
         input = op.inputs[0]
         ref_input = cls._deeplift_ref[op.name]
@@ -362,13 +535,36 @@ class DeepLIFTRescale(GradientBasedMethod):
         delta_out = output - ref_output
         delta_in = input - ref_input
         instant_grad = activation(op.type)(0.5 * (ref_input + input))
-        return tf.where(tf.abs(delta_in) > 1e-5, grad * delta_out / delta_in,
-                        original_grad(instant_grad.op, grad))
+        # print("IN GRAD OVERRIDE")
+        testing = False
+        if testing:
+
+            print('GRAD')
+            p1 = tf.print(('output', output))
+            p2 = tf.print(('input',input))
+            p3 = tf.print(('ref_input',ref_input))
+            p4 = tf.print(('ref_output',ref_output))
+            p5 = tf.print(('delta_out',delta_out))
+            p6 = tf.print(('delta_in',delta_in))
+            tf.print(('delta_in',delta_in))
+            print("printing python id of ref_input")
+            print(id(ref_input))
+            to_print = tf.print((('output', output), ('input',input),('ref_input',ref_input),  ('ref_output',ref_output),('delta_out',delta_out), ('delta_in',delta_in)))
+
+            with tf.control_dependencies([to_print]):
+                result = tf.where(tf.abs(delta_in) > 1e-5, grad * delta_out / delta_in, original_grad(instant_grad.op, grad))
+        else:
+            result = tf.where(tf.abs(delta_in) > 1e-5, grad * delta_out / delta_in, original_grad(instant_grad.op, grad))
+            # result = tf.where(tf.abs(delta_in) > 1e-5, grad * delta_out / delta_in, original_grad(instant_grad.op, grad))
+        return result
+        #return tf.where(tf.abs(delta_in) > 1e-5, grad * delta_out / delta_in,
+        #                original_grad(instant_grad.op, grad))
 
     def _init_references(self):
-        # print ('DeepLIFT: computing references...')
+        print ('DeepLIFT: computing references...')
         sys.stdout.flush()
         self._deeplift_ref.clear()
+        self._deeplift_ref_out.clear()
         ops = []
         g = tf.get_default_graph()
         for op in g.get_operations():
@@ -376,8 +572,11 @@ class DeepLIFTRescale(GradientBasedMethod):
                 if op.type in SUPPORTED_ACTIVATIONS:
                     ops.append(op)
         YR = self._session_run([o.inputs[0] for o in ops], self.baseline)
+        activs = self._session_run([o.outputs[0] for o in ops], self.baseline)
         for (r, op) in zip(YR, ops):
             self._deeplift_ref[op.name] = r
+        for (r, op) in zip(activs, ops):
+            self._deeplift_ref_out[op.name] = r
         # print('DeepLIFT: references ready')
         sys.stdout.flush()
 
@@ -440,32 +639,187 @@ class IntegratedDeepLIFT_v2(GradientBasedMethod):
         sys.stdout.flush()
 
 
-
-class IntegratedDeepLIFT(GradientBasedMethod): #shapes of self.Y and ys do not match
+class IntegratedDeepLIFT_batch(GradientBasedMethod): #shapes of self.Y and ys do not match
 
     _deeplift_ref = {}
     def __init__(self, T, X, session, keras_learning_phase, steps=100, baseline=None):
         self.baseline = baseline
         self.steps = steps
-        super(IntegratedDeepLIFT, self).__init__(T, X, session, keras_learning_phase)
+        super(IntegratedDeepLIFT_batch, self).__init__(T, X, session, keras_learning_phase)
 
     def run(self, xs, ys=None, batch_size=None):
         self._check_input_compatibility(xs, ys, batch_size)
 
         results = []
+        interpolation_time = 0
+        session_run_time = 0
+        gradient_time = 0
 
-        for x in xs: #for each example:
+        n = xs.shape[0]
+        print(n)
+        if batch_size == None:
+            batch_size = n
+        for i in range(batch_size):
+            x = xs[i*n//batch_size : (i+1)*n//batch_size]
+
+        # for x in xs: #for each example:
             self.baseline = np.zeros(xs.shape[1:])
-            interpolation = [self.baseline + i/self.steps*(x - self.baseline) for i in range(self.steps+1)] #evenly-spaced steps ranging from baseline to example's input values
+
+            start = time()
+            # interpolation = [self.baseline + i/self.steps*(x - self.baseline) for i in range(self.steps+1)] #evenly-spaced steps ranging from baseline to example's input values
+
+            alpha_values = np.linspace(0, 1.0, self.steps+1)
+            x_minus_baseline = x - self.baseline
+            correct_shape = (self.steps+1,) + (1,) * (len(xs.shape) - 1)
+            # interpolation = self.baseline[None, :] + alpha_values[:, None] * x_minus_baseline[None, :]
+            interpolation = self.baseline[None, :] + alpha_values.reshape(correct_shape) * x_minus_baseline[None, :]
+
+
+            end = time()
+            interpolation_time += end - start
+
+            start = time()
             attribs = self._session_run(self.explain_symbolic(), interpolation, ys, batch_size)[0] #run attributions with all steps of interpolation at once
+            end = time()
+            session_run_time += end - start
+
+            start = time()
             gradient = np.sum(np.array(attribs[1:]), axis=0) #ignore 1st step, which uses baseline as input
+            end = time()
+            gradient_time += end - start
             results.append(gradient * (x - self.baseline)/self.steps) #result is sum of all (gradient * change in step)
 
+        # print('interpolation', interpolation_time)
+        # print('session run', session_run_time)
+        # print('gradient', gradient_time)
+        # print()
         return results
 
 
     @classmethod
     def nonlinearity_grad_override(cls, op, grad): #custom gradient for DeepLIFT multiplier
+        if op.type == 'MaxPool':
+            output = op.outputs[0]
+            input = op.inputs[0]
+            ref_input = tf.concat([input[0:1], input[0:-1]], axis=0) #input[0:1] is 1st component; input[0:-1] ranges from 1st to second-to-last component
+            ref_output = tf.concat([output[0:1], output[0:-1]], axis=0) #same logic
+            # ref_input = cls._deeplift_ref[op.name]
+            # rout = cls._deeplift_ref_out[op.name]#
+            delta_in = input - ref_input
+
+            # dup0 = [2] + [1 for i in delta_in.shape[1:]]
+            cross_max = tf.maximum(output, ref_output)
+            # diffs = tf.concat([cross_max - rout, xout - cross_max], 0)
+            # xmax_pos,rmax_pos = tf.split(original_grad(op, grad * diffs), 2) #
+            diff1 = cross_max - ref_output
+            diff2 = output - cross_max
+            xmax_pos = original_grad(op, grad*diff1)#*diff1#*diffs) #* diffs
+
+
+
+
+
+
+            # getting arguments from op
+            node_def = op.node_def
+            padding = node_def.attr["padding"].s.decode("ASCII")
+            strides = node_def.attr["strides"].list.i
+            strides = list(strides)
+            ksize = node_def.attr["ksize"].list.i
+            ksize = list(ksize)
+
+            # # prepare tiling
+            # batch_size = tf.shape(grad)[0:1]
+            # batch_size = tf.expand_dims(batch_size, 0)
+            # # print("batch_size")
+            # # print(batch_size)
+            #
+            # ones = tf.constant([1]*(len(ref_input.shape)-1),dtype=tf.dtypes.int32)
+            # ones = tf.expand_dims(ones, 0)
+            # # print("ones")
+            # # print(ones)
+            #
+            # multiples = tf.concat([batch_size, ones], axis=1)
+            # multiples = multiples[0]
+            # # print("multiples")
+            # # print(multiples)
+            #
+            # correct_input_shape = tf.shape(input)
+            # tf_ref_input = tf.constant(ref_input)
+            # tiled_ref_input = tf.tile(tf_ref_input, multiples)
+            # tiled_ref_input = tf.reshape(tiled_ref_input, correct_input_shape)
+            #
+            # correct_output_shape = tf.shape(xout)
+            #
+            # ones = tf.constant([1]*(len(rout.shape)-1),dtype=tf.dtypes.int32)
+            # ones = tf.expand_dims(ones, 0)
+            # # print("ones")
+            # # print(ones)
+            #
+            # multiples = tf.concat([batch_size, ones], axis=1)
+            # multiples = multiples[0]
+            # # print("multiples")
+            # # print(multiples)
+            #
+            # tiled_ref_output = tf.tile(rout, multiples)
+            # tiled_ref_output = tf.reshape(tiled_ref_output, correct_output_shape)
+            # print("tiled_ref_input")
+            # print(tiled_ref_input)
+            rmax_pos = nn_grad.gen_nn_ops.max_pool_grad(
+                orig_input= ref_input,#tf.ones((tf.shape(grad)[0], 1)) * ref_input,
+                orig_output= ref_output, # tf.ones((tf.shape(grad)[0], 1)) * rout,
+                grad=grad*diff2,
+                #ksize=[1]+list(self.pool_size)+[1],
+                ksize=ksize,#[1,2,2,1],#[1]+op.ksize+[1],
+                strides=strides,#[1,2,2,1],#[1]+list(op.strides)+[1],
+                padding=padding)#"VALID")#op.padding)
+
+            t = False
+            print('in maxpool')
+            if t:
+                print("grad")
+                print(grad)
+                print("input")
+                print(input)
+                print("diff1")
+                print(diff1)
+                print("diff2")
+                print(diff2)
+                print("rmax_pos")
+                print(rmax_pos)
+                print("xmax_pos")
+                print(xmax_pos)
+                print("ref_input")
+                print(ref_input.shape)
+            testing1 = False
+            if testing1:
+
+                print('printed')
+                p1 = tf.print(('xout', output))
+                p2 = tf.print(('input',input))
+                p3 = tf.print(('ref_input',ref_input))
+                p4 = tf.print(('rout',ref_output))
+                p6 = tf.print(('delta_in',delta_in))
+                # print("printing python id of ref_input")
+                # print(id(ref_input))
+                # to_print = tf.print((('output', xout), ('input',input),('ref_input',ref_input),  ('ref_output',rout),('cross_max', cross_max), ('diff1', diff1), ('delta_in',delta_in), ('xmax_pos', xmax_pos), ('rmax_pos', rmax_pos)))
+                to_print = tf.print((('grad.shape', grad.shape), ('xmax_pos', xmax_pos), ('rmax_pos', rmax_pos), ('diff1.shape', diff1.shape),('xmax_pos.shape', xmax_pos.shape) ))
+
+                with tf.control_dependencies([to_print]):
+                    result = tf.where(
+                        tf.abs(delta_in) < 1e-5,
+                        tf.zeros_like(delta_in),
+                        (xmax_pos + rmax_pos) / delta_in
+                    )
+                    return result
+                # return
+            return tf.where(
+                tf.abs(delta_in) < 1e-7, # before 1e-5
+                tf.zeros_like(delta_in),
+                #original_grad(op, grad),
+                (xmax_pos + rmax_pos) / delta_in
+            )
+
         input = op.inputs[0] #inputs to `op`, using all steps in the interpolation as model input, for a single example
         output = op.outputs[0] #outputs from op ''
 
@@ -483,42 +837,309 @@ class IntegratedDeepLIFT(GradientBasedMethod): #shapes of self.Y and ys do not m
         return tf.where(tf.abs(delta_in) > 1e-5, grad * delta_out / delta_in,
                                original_grad(instant_grad.op, grad))
 
+class IntegratedDeepLIFT(GradientBasedMethod): #shapes of self.Y and ys do not match
 
-class IntegratedDeepLIFT_true(GradientBasedMethod):
     _deeplift_ref = {}
-
     def __init__(self, T, X, session, keras_learning_phase, steps=100, baseline=None):
-        #baseline, init refs, explain symbolic should all be done
         self.baseline = baseline
         self.steps = steps
-        super(IntegratedDeepLIFT_true, self).__init__(T, X, session, keras_learning_phase)
+        super(IntegratedDeepLIFT, self).__init__(T, X, session, keras_learning_phase)
 
     def run(self, xs, ys=None, batch_size=None):
         self._check_input_compatibility(xs, ys, batch_size)
 
+        results = []
+        interpolation_time = 0
+        session_run_time = 0
+        gradient_time = 0
+
+        for x in xs: #for each example:
+            self.baseline = np.zeros(xs.shape[1:])
+
+            start = time()
+            # interpolation = [self.baseline + i/self.steps*(x - self.baseline) for i in range(self.steps+1)] #evenly-spaced steps ranging from baseline to example's input values
+
+            alpha_values = np.linspace(0, 1.0, self.steps+1)
+            x_minus_baseline = x - self.baseline
+            correct_shape = (self.steps+1,) + (1,) * (len(xs.shape) - 1)
+            # interpolation = self.baseline[None, :] + alpha_values[:, None] * x_minus_baseline[None, :]
+            interpolation = self.baseline[None, :] + alpha_values.reshape(correct_shape) * x_minus_baseline[None, :]
+
+
+            end = time()
+            interpolation_time += end - start
+
+            start = time()
+            attribs = self._session_run(self.explain_symbolic(), interpolation, ys, batch_size)[0] #run attributions with all steps of interpolation at once
+            end = time()
+            session_run_time += end - start
+
+            start = time()
+            gradient = np.sum(np.array(attribs[1:]), axis=0) #ignore 1st step, which uses baseline as input
+            end = time()
+            gradient_time += end - start
+            results.append(gradient * (x - self.baseline)/self.steps) #result is sum of all (gradient * change in step)
+
+        # print('interpolation', interpolation_time)
+        # print('session run', session_run_time)
+        # print('gradient', gradient_time)
+        # print()
+        return results
+
+
+    @classmethod
+    def nonlinearity_grad_override(cls, op, grad): #custom gradient for DeepLIFT multiplier
+        if op.type == 'MaxPool':
+            output = op.outputs[0]
+            input = op.inputs[0]
+            ref_input = tf.concat([input[0:1], input[0:-1]], axis=0) #input[0:1] is 1st component; input[0:-1] ranges from 1st to second-to-last component
+            ref_output = tf.concat([output[0:1], output[0:-1]], axis=0) #same logic
+            # ref_input = cls._deeplift_ref[op.name]
+            # rout = cls._deeplift_ref_out[op.name]#
+            delta_in = input - ref_input
+
+            # dup0 = [2] + [1 for i in delta_in.shape[1:]]
+            cross_max = tf.maximum(output, ref_output)
+            # diffs = tf.concat([cross_max - rout, xout - cross_max], 0)
+            # xmax_pos,rmax_pos = tf.split(original_grad(op, grad * diffs), 2) #
+            diff1 = cross_max - ref_output
+            diff2 = output - cross_max
+            xmax_pos = original_grad(op, grad*diff1)#*diff1#*diffs) #* diffs
+
+
+
+
+
+
+            # getting arguments from op
+            node_def = op.node_def
+            padding = node_def.attr["padding"].s.decode("ASCII")
+            strides = node_def.attr["strides"].list.i
+            strides = list(strides)
+            ksize = node_def.attr["ksize"].list.i
+            ksize = list(ksize)
+
+            # # prepare tiling
+            # batch_size = tf.shape(grad)[0:1]
+            # batch_size = tf.expand_dims(batch_size, 0)
+            # # print("batch_size")
+            # # print(batch_size)
+            #
+            # ones = tf.constant([1]*(len(ref_input.shape)-1),dtype=tf.dtypes.int32)
+            # ones = tf.expand_dims(ones, 0)
+            # # print("ones")
+            # # print(ones)
+            #
+            # multiples = tf.concat([batch_size, ones], axis=1)
+            # multiples = multiples[0]
+            # # print("multiples")
+            # # print(multiples)
+            #
+            # correct_input_shape = tf.shape(input)
+            # tf_ref_input = tf.constant(ref_input)
+            # tiled_ref_input = tf.tile(tf_ref_input, multiples)
+            # tiled_ref_input = tf.reshape(tiled_ref_input, correct_input_shape)
+            #
+            # correct_output_shape = tf.shape(xout)
+            #
+            # ones = tf.constant([1]*(len(rout.shape)-1),dtype=tf.dtypes.int32)
+            # ones = tf.expand_dims(ones, 0)
+            # # print("ones")
+            # # print(ones)
+            #
+            # multiples = tf.concat([batch_size, ones], axis=1)
+            # multiples = multiples[0]
+            # # print("multiples")
+            # # print(multiples)
+            #
+            # tiled_ref_output = tf.tile(rout, multiples)
+            # tiled_ref_output = tf.reshape(tiled_ref_output, correct_output_shape)
+            # print("tiled_ref_input")
+            # print(tiled_ref_input)
+            rmax_pos = nn_grad.gen_nn_ops.max_pool_grad(
+                orig_input= ref_input,#tf.ones((tf.shape(grad)[0], 1)) * ref_input,
+                orig_output= ref_output, # tf.ones((tf.shape(grad)[0], 1)) * rout,
+                grad=grad*diff2,
+                #ksize=[1]+list(self.pool_size)+[1],
+                ksize=ksize,#[1,2,2,1],#[1]+op.ksize+[1],
+                strides=strides,#[1,2,2,1],#[1]+list(op.strides)+[1],
+                padding=padding)#"VALID")#op.padding)
+
+            t = False
+            print('in maxpool')
+            if t:
+                print("grad")
+                print(grad)
+                print("input")
+                print(input)
+                print("diff1")
+                print(diff1)
+                print("diff2")
+                print(diff2)
+                print("rmax_pos")
+                print(rmax_pos)
+                print("xmax_pos")
+                print(xmax_pos)
+                print("ref_input")
+                print(ref_input.shape)
+            testing1 = False
+            if testing1:
+
+                print('printed')
+                p1 = tf.print(('xout', output))
+                p2 = tf.print(('input',input))
+                p3 = tf.print(('ref_input',ref_input))
+                p4 = tf.print(('rout',ref_output))
+                p6 = tf.print(('delta_in',delta_in))
+                # print("printing python id of ref_input")
+                # print(id(ref_input))
+                # to_print = tf.print((('output', xout), ('input',input),('ref_input',ref_input),  ('ref_output',rout),('cross_max', cross_max), ('diff1', diff1), ('delta_in',delta_in), ('xmax_pos', xmax_pos), ('rmax_pos', rmax_pos)))
+                to_print = tf.print((('grad.shape', grad.shape), ('xmax_pos', xmax_pos), ('rmax_pos', rmax_pos), ('diff1.shape', diff1.shape),('xmax_pos.shape', xmax_pos.shape) ))
+
+                with tf.control_dependencies([to_print]):
+                    result = tf.where(
+                        tf.abs(delta_in) < 1e-5,
+                        tf.zeros_like(delta_in),
+                        (xmax_pos + rmax_pos) / delta_in
+                    )
+                    return result
+                # return
+            return tf.where(
+                tf.abs(delta_in) < 1e-7, # before 1e-5
+                tf.zeros_like(delta_in),
+                #original_grad(op, grad),
+                (xmax_pos + rmax_pos) / delta_in
+            )
+
+        input = op.inputs[0] #inputs to `op`, using all steps in the interpolation as model input, for a single example
+        output = op.outputs[0] #outputs from op ''
+
+        #`ref_input` (below) is the list of reference values, for the corresponding input values in `input` (with steps in interpolation as model input).
+        #Because for each step in the interpolation, its reference value is equal to the previous step's value,
+        #the reference for a step in `input` is equal to the previous step's value.
+        #So we define ref_input to be `input`, shifted one index to the right, so that each step in `input` can be matched with its "previous step" in `ref_input`.
+        #To keep dimensions correct, the 1st step in `ref_input` (which is now empty) will be set to the 1st step in `input` (e.g. if `input` is [1,2,3,4], `ref_input` is [1,1,2,3]).
+        #We will be ignoring the 1st index of the attributions anyway, because it corresponds to the baseline as input.
+        ref_input = tf.concat([input[0:1], input[0:-1]], axis=0) #input[0:1] is 1st component; input[0:-1] ranges from 1st to second-to-last component
+        ref_output = tf.concat([output[0:1], output[0:-1]], axis=0) #same logic for reference output
+        delta_out = output - ref_output
+        delta_in = input - ref_input
+        instant_grad = activation(op.type)(0.5 * (ref_input + input))
+        return tf.where(tf.abs(delta_in) > 1e-5, grad * delta_out / delta_in,
+                               original_grad(instant_grad.op, grad))
+
+# potential problem: self.gradients is cached and will not reload; so old values of deeplift_ref are cached there??? ie gradient constant values perfectly preserved
+class IntegratedDeepLIFT_true(GradientBasedMethod):
+    _deeplift_ref = {}
+    _deeplift_ref_out = {}
+    def __init__(self, T, X, session, keras_learning_phase, steps=100, baseline=None):
+        #baseline, init refs, explain symbolic should all be done
+        self.baseline = baseline
+        self.expanded_baseline = None
+        self.steps = steps
+
+        self.T = T  # target Tensor
+        self.X = X  # input Tensor
+        self.Y_shape = [None,] + T.get_shape().as_list()[1:]
+        # Most often T contains multiple output units. In this case, it is often necessary to select
+        # a single unit to compute contributions for. This can be achieved passing 'ys' as weight for the output Tensor.
+        self.Y = tf.placeholder(tf.float32, self.Y_shape)
+        # placeholder_from_data(ys) if ys is not None else 1.0  # Tensor that represents weights for T
+        self.T = self.T * self.Y
+        self.symbolic_attribution = None
+        self.session = session
+        self.keras_learning_phase = keras_learning_phase
+        self.has_multiple_inputs = type(self.X) is list or type(self.X) is tuple
+        logging.info('Model with multiple inputs: %s' % self.has_multiple_inputs)
+
+        # Set baseline
+        # TODO: now this sets a baseline also for those methods that does not require it
+        self._set_check_baseline()
+
+        # References
+        # self._init_references()
+
+        # Create symbolic explanation once during construction (affects only gradient-based methods)
+        # self.explain_symbolic()
+        # super(IntegratedDeepLIFT_true, self).__init__(T, X, session, keras_learning_phase)
+
+    def run(self, xs, ys=None, batch_size=None):
+        self._check_input_compatibility(xs, ys, batch_size)
+        # baseline to match n x input size
+        self.expanded_baseline = np.broadcast_to(self.baseline[0], xs.shape) # np.broadcast_to(self.baseline[0], (xs.shape[0],) + self.baseline.shape[1:])
+        # print(self.expanded_baseline.shape)
+        # do this after size of input is known
+        self._init_references()
+        self.explain_symbolic()
+
+        self.session.run(tf.initialize_variables(self._deeplift_ref.values()))
+        self.session.run(tf.initialize_variables(self._deeplift_ref_out.values()))
         gradient = None
-        xs_mod_baseline = self.baseline
         for alpha in list(np.linspace(1. / self.steps, 1.0, self.steps)):
             xs_mod = [b + (x - b) * alpha for x, b in zip(xs, self.baseline)] if self.has_multiple_inputs \
                 else self.baseline + (xs - self.baseline) * alpha
 
             _attr = self._session_run(self.explain_symbolic(), xs_mod, ys, batch_size)
+
             if gradient is None: gradient = _attr
             else: gradient = [g + a for g, a in zip(gradient, _attr)]
-            xs_mod_baseline = xs_mod
             #update references
             self._init_references_input(xs_mod)
-
 
         results = [g * (x - b) / self.steps for g, x, b in zip(
             gradient,
             xs if self.has_multiple_inputs else [xs],
             self.baseline if self.has_multiple_inputs else [self.baseline])]
-
+        # print("results")
+        # print(results[0])
         return results[0] if not self.has_multiple_inputs else results
 
     @classmethod
-    def nonlinearity_grad_override(cls, op, grad): #update: have to update deeplift_ref to be the curr input
+    def nonlinearity_grad_override(cls, op, grad):
+        # print(op.type)
+        if op.type == 'MaxPool':
+            print('hello')
+            xout = op.outputs[0]
+            input = op.inputs[0]
+            ref_input = cls._deeplift_ref[op.name]
+            rout = cls._deeplift_ref_out[op.name]#
+            delta_in = input - ref_input
+
+            # dup0 = [2] + [1 for i in delta_in.shape[1:]]
+            cross_max = tf.maximum(xout, rout)
+            # diffs = tf.concat([cross_max - rout, xout - cross_max], 0)
+            # xmax_pos,rmax_pos = tf.split(original_grad(op, grad * diffs), 2) #
+            diff1 = cross_max - rout
+            diff2 = xout - cross_max
+            xmax_pos = original_grad(op, grad*diff1)#*diff1#*diffs) #* diffs
+            rmax_pos = original_grad(op, grad*diff2)#*diff2#*diffs) #* diffs
+            testing1 = False
+            if testing1:
+
+                print('printed')
+                p1 = tf.print(('xout', xout))
+                p2 = tf.print(('input',input))
+                p3 = tf.print(('ref_input',ref_input))
+                p4 = tf.print(('rout',rout))
+                p6 = tf.print(('delta_in',delta_in))
+                # print("printing python id of ref_input")
+                # print(id(ref_input))
+                # to_print = tf.print((('output', xout), ('input',input),('ref_input',ref_input),  ('ref_output',rout),('cross_max', cross_max), ('diff1', diff1), ('delta_in',delta_in), ('xmax_pos', xmax_pos), ('rmax_pos', rmax_pos)))
+                to_print = tf.print((('grad.shape', grad.shape), ('xmax_pos', xmax_pos), ('rmax_pos', rmax_pos), ('diff1.shape', diff1.shape),('xmax_pos.shape', xmax_pos.shape) ))
+
+                with tf.control_dependencies([to_print]):
+                    result = tf.where(
+                        tf.abs(delta_in) < 1e-5,
+                        tf.zeros_like(delta_in),
+                        (xmax_pos + rmax_pos) / delta_in
+                    )
+                    return result
+            # return
+            return tf.where(
+                tf.abs(delta_in) < 1e-5,
+                tf.zeros_like(delta_in),
+                (xmax_pos + rmax_pos) / delta_in
+            )
         output = op.outputs[0]
         input = op.inputs[0]
         ref_input = cls._deeplift_ref[op.name]
@@ -527,19 +1148,57 @@ class IntegratedDeepLIFT_true(GradientBasedMethod):
         delta_in = input - ref_input
         instant_grad = activation(op.type)(0.5 * (ref_input + input))
 
-        ans = tf.where(tf.abs(delta_in) > 1e-5, grad * delta_out / delta_in,
-                        original_grad(instant_grad.op, grad)) #compute before you update ref
-        cls._deeplift_ref[op.name] = input #based on interpolation, curr input is next ref_input
-        return ans
+        testing = False
+        if testing:
+
+            print('GRAD')
+            p1 = tf.print(('output', output))
+            p2 = tf.print(('input',input))
+            p3 = tf.print(('ref_input',ref_input))
+            p4 = tf.print(('ref_output',ref_output))
+            p5 = tf.print(('delta_out',delta_out))
+            p6 = tf.print(('delta_in',delta_in))
+            print("printing python id of ref_input")
+            print(id(ref_input))
+            to_print = tf.print((('output', output), ('input',input),('ref_input',ref_input),  ('ref_output',ref_output),('delta_out',delta_out), ('delta_in',delta_in)))
+
+            with tf.control_dependencies([to_print]):
+                result = tf.where(tf.abs(delta_in) > 1e-5, grad * delta_out / delta_in, original_grad(instant_grad.op, grad))
+        else:
+            result = tf.where(tf.abs(delta_in) > 1e-5, grad * delta_out / delta_in, original_grad(instant_grad.op, grad))
+        return result
 
     def _init_references(self):
         # print ('DeepLIFT: computing references...')
-        self._init_references(self.baseline)
+        sys.stdout.flush()
+        self._deeplift_ref.clear()
+        self._deeplift_ref_out.clear()
+        ops = []
+        g = tf.get_default_graph()
+        for op in g.get_operations():
+            if len(op.inputs) > 0 and not op.name.startswith('gradients'):
+                if op.type in SUPPORTED_ACTIVATIONS:
+                    ops.append(op)
+        YR = self._session_run([o.inputs[0] for o in ops], self.expanded_baseline)
+        activs = self._session_run([o.outputs[0] for o in ops], self.expanded_baseline)
+        for (r, op) in zip(YR, ops):
+            # print(op.name)
+            # print("value of reference to set:", r)
+            self._deeplift_ref[op.name] = tf.Variable(r) # create Variable
+            #self._deeplift_ref[op.name].load(r, self.session)
+        for (r, op) in zip(activs, ops):
+            # print(op.name)
+            # print("value of reference to set:", r)
+            self._deeplift_ref_out[op.name] = tf.Variable(r) # create Variable
+        # self.session.run(tf.global_variables_initializer())
+        # print('DeepLIFT: references ready')
+        # print(self._deeplift_ref)
+        sys.stdout.flush()
 
     def _init_references_input(self, xs):
         # print ('DeepLIFT: computing references...')
         sys.stdout.flush()
-        self._deeplift_ref.clear()
+        # self._deeplift_ref.clear()
         ops = []
         g = tf.get_default_graph()
         for op in g.get_operations():
@@ -547,10 +1206,159 @@ class IntegratedDeepLIFT_true(GradientBasedMethod):
                 if op.type in SUPPORTED_ACTIVATIONS:
                     ops.append(op)
         YR = self._session_run([o.inputs[0] for o in ops], xs)
+        activs = self._session_run([o.outputs[0] for o in ops], xs)
+        # print(YR)
+        # print('OPS')
         for (r, op) in zip(YR, ops):
-            self._deeplift_ref[op.name] = r
+            # print(op.name)
+            # print("value of reference to set:", r)
+            if op.name in self._deeplift_ref: # check if op already present
+                #print('ALREADY CONTAINED')
+                # print("setting", op.name)
+                # print( self.session.run(self._deeplift_ref[op.name].assign(r)) )#, self.session)
+                # print("checking if value updated")
+                # print( self.session.run(self._deeplift_ref[op.name] ) )
+                # print("printing python id of _deeplift_ref op")
+                # print(id(self._deeplift_ref[op.name]))
+                self._deeplift_ref[op.name].load(r, self.session)
+
+            else:
+                print('NOT PRESENT')
+                self._deeplift_ref[op.name] = tf.Variable(r)
+
+        for (r, op) in zip(activs, ops):
+            # print(op.name)
+            # print("value of reference to set:", r)
+            if op.name in self._deeplift_ref_out: # check if op already present
+                #print('ALREADY CONTAINED')
+                # print("setting", op.name)
+                # print( self.session.run(self._deeplift_ref[op.name].assign(r)) )#, self.session)
+                # print("checking if value updated")
+                # print( self.session.run(self._deeplift_ref[op.name] ) )
+                # print("printing python id of _deeplift_ref op")
+                # print(id(self._deeplift_ref[op.name]))
+                self._deeplift_ref_out[op.name].load(r, self.session)
+
+            else:
+                print('NOT PRESENT')
+                self._deeplift_ref_out[op.name] = tf.Variable(r)
         # print('DeepLIFT: references ready')
+        # print(self._deeplift_ref)
         sys.stdout.flush()
+
+
+
+
+class IntegratedDeepLIFT_old_but_works(GradientBasedMethod):
+
+    _deeplift_ref = {}
+    def __init__(self, T, X, xs, session, keras_learning_phase, steps=100, baseline=None):
+        super(IntegratedDeepLIFT_old, self).__init__(T, X, xs, session, keras_learning_phase)
+        self.steps = steps
+        self.baseline = baseline
+    @classmethod
+    def nonlinearity_grad_override(cls, op, grad):
+        output = op.outputs[0]
+        input = op.inputs[0]
+        ref_input = cls._deeplift_ref[op.name]
+        ref_output = activation(op.type)(ref_input)
+        delta_out = output - ref_output
+        delta_in = input - ref_input
+        instant_grad = activation(op.type)(0.5 * (ref_input + input))
+        result = tf.where(tf.abs(delta_in) > 1e-5, grad * delta_out / delta_in,
+                               original_grad(instant_grad.op, grad))
+        testing = True
+        if testing:
+            print('GRAD')
+            print('output', output)
+            print('input', input)
+            print('ref_input', ref_input)
+            print('ref_output', ref_output)
+            print('delta_out', delta_out)
+            print('delta_in', delta_in)
+            print('result', result)
+        return result
+
+    def _set_check_baseline(self):
+        if self.baseline is None:
+            if self.has_multiple_inputs:
+                self.baseline = [np.zeros(xi.shape) for xi in self.xs]
+            else:
+                self.baseline = np.zeros(self.xs.shape) #DEFAULT CASE; assume shape of xs including # of samples
+
+        else:
+            if self.has_multiple_inputs:
+                for i, xi in enumerate(self.xs):
+                    if self.baseline[i].shape == self.xs[i].shape[1:]:
+                        self.baseline[i] = np.expand_dims(self.baseline[i], 0)
+                    else:
+                        raise RuntimeError('Baseline shape %s does not match expected shape %s'
+                                           % (self.baseline[i].shape, self.xs[i].shape[1:]))
+            else:
+                if self.baseline.shape == self.xs.shape[1:]:
+                    self.baseline = np.expand_dims(self.baseline, 0)
+                else:
+                    raise RuntimeError('Baseline shape %s does not match expected shape %s'
+                                       % (self.baseline.shape, self.xs.shape[1:]))
+
+    def run(self):
+        # Check user baseline or set default one
+        self._set_check_baseline()
+        # print ('DeepLIFT: computing references...')
+        sys.stdout.flush()
+        self._deeplift_ref.clear()
+
+        ops = []
+        g = tf.get_default_graph()
+        for op in g.get_operations():
+            if len(op.inputs) > 0 and not op.name.startswith('gradients'):
+                if op.type in SUPPORTED_ACTIVATIONS:
+                    ops.append(op)
+
+        initial_reference_values = self.session_run([o.inputs[0] for o in ops], self.baseline)
+        for op,ref_val in zip(ops,initial_reference_values):
+            print('op name and val')
+            print(op.name)
+            print(ref_val)
+            self._deeplift_ref[op.name] = tf.Variable(ref_val, name=op.name+"_reference")
+        print('first ref:')
+        print(self._deeplift_ref)
+        attributions = self.get_symbolic_attribution()
+        gradient = None
+
+        for alpha in list(np.linspace(0, 1.0, num=self.steps, endpoint=False)):
+            xs_mod = [b + (xs - b) * alpha for xs, b in zip(self.xs, self.baseline)] if self.has_multiple_inputs \
+                else self.baseline + (self.xs - self.baseline) * alpha #"baseline" xs
+
+            xs_mod1 = [b + (xs - b) * (alpha + 1.0/self.steps) for xs, b in zip(self.xs, self.baseline)] if self.has_multiple_inputs \
+                else self.baseline + (self.xs - self.baseline) * (alpha + 1.0/self.steps) #"actual" xs
+
+            # Init references with a forward pass
+            ref_values = self.session_run([o.inputs[0] for o in ops], xs_mod)
+            print(alpha, ' ref:')
+            for op,ref_val in zip(ops,ref_values):
+                print('op name and val')
+                print(op.name)
+                print(ref_val)
+                self._deeplift_ref[op.name].load(ref_val, self.session)
+
+            print(self._deeplift_ref)
+            print('xs_mod')
+            print(xs_mod1)
+            _attr = self.session_run(attributions, xs_mod1)
+            print('attr')
+            print(_attr)
+            if gradient is None: gradient = _attr
+            else: gradient = [g + a for g, a in zip(gradient, _attr)]
+
+        print('grads')
+        print(gradient)
+        results = [g * (x - b) / self.steps for g, x, b in zip(
+            gradient,
+            self.xs if self.has_multiple_inputs else [self.xs],
+            self.baseline if self.has_multiple_inputs else [self.baseline])]
+
+        return results[0] if not self.has_multiple_inputs else results
 
 """
 Occlusion method
@@ -708,7 +1516,9 @@ attribution_methods = OrderedDict({
     'shapley_sampling': (ShapleySampling, 7),
     'integdeeplift': (IntegratedDeepLIFT_v2, 8),
     'idl': (IntegratedDeepLIFT, 9),
-    'idl_true': (IntegratedDeepLIFT_true, 10)
+    'idl_true': (IntegratedDeepLIFT_true, 10),
+    'intgrad_new': (IntegratedGradients_new, 11),
+    'idl_batch': (IntegratedDeepLIFT_batch, 12)
 })
 
 
@@ -772,7 +1582,7 @@ class DeepExplain(object):
 
         logging.info('DeepExplain: running "%s" explanation method (%d)' % (self.method, method_flag))
         self._check_ops()
-        _GRAD_OVERRIDE_CHECKFLAG = 0
+        _GRAD_OVERRIDE_CHECKFLAG = 0 # modified?
 
         _ENABLED_METHOD_CLASS = method_class
         method = _ENABLED_METHOD_CLASS(T, X,
@@ -784,14 +1594,16 @@ class DeepExplain(object):
             warnings.warn('DeepExplain detected you are trying to use an attribution method that requires '
                           'gradient override but the original gradient was used instead. You might have forgot to '
                           '(re)create your graph within the DeepExlain context. Results are not reliable!')
-        _ENABLED_METHOD_CLASS = None
+        # commented out, otherwise gradient override will be called once Method is constructed, and then turn off (?)
+        # _ENABLED_METHOD_CLASS = None
         _GRAD_OVERRIDE_CHECKFLAG = 0
         self.keras_phase_placeholder = None
         return method
 
     def explain(self, method, T, X, xs, ys=None, batch_size=None, **kwargs):
         explainer = self.get_explainer(method, T, X, **kwargs)
-        return explainer.run(xs, ys, batch_size)
+        result = explainer.run(xs, ys, batch_size)
+        return result
 
     @staticmethod
     def get_override_map():
